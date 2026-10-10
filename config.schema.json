@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "ExampleHomebridgePlugin",
+  "pluginAlias": "Toniebox",
   "pluginType": "platform",
   "singular": true,
   "strictValidation": false,
@@ -11,7 +11,7 @@
       "name": {
         "title": "Name",
         "type": "string",
-        "default": "Example Dynamic Platform"
+        "default": "Toniebox"
       }
     }
   }
