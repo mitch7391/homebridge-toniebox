@@ -1,185 +1,63 @@
-<p align="center">
+# homebridge-toniebox
 
-<img src="https://github.com/homebridge/branding/raw/latest/logos/homebridge-wordmark-logo-vertical.png" width="150">
+Homebridge plugin for Toniebox devices, currently in development.
 
-</p>
+Increment 1 provides an inert platform shell and offline validation. It does not
+authenticate with Tonies, discover devices, connect to MQTT, create accessories,
+or control a Toniebox. Do not install it on a production Homebridge instance yet.
+The package remains private.
 
-<span align="center">
+## Development
 
-# Homebridge Platform Plugin Template
+Use a dedicated checkout and development branch. The runtime targets remain
+Node.js `^22.10.0 || ^24.0.0` and Homebridge `^1.8.0 || ^2.0.0`.
 
-</span>
+Use current Node.js 22 (at least 22.13 for ESLint) or 24 for development; Node 24
+is recommended. The development Homebridge types currently come from 2.x.
+The mocked platform tests do not establish full Homebridge 1.x/2.x integration
+compatibility.
 
-This is a template Homebridge dynamic platform plugin and can be used as a base to help you get started developing your own plugin.
-
-This template should be used in conjunction with the [developer documentation](https://developers.homebridge.io/). A full list of all supported service types, and their characteristics is available on this site.
-
-### Clone As Template
-
-Click the link below to create a new GitHub Repository using this template, or click the *Use This Template* button above.
-
-<span align="center">
-
-### [Create New Repository From Template](https://github.com/homebridge/homebridge-plugin-template/generate)
-
-</span>
-
-### Setup Development Environment
-
-To develop Homebridge plugins you must have Node.js 22 or later installed, and a modern code editor such as [VS Code](https://code.visualstudio.com/). This plugin template uses [TypeScript](https://www.typescriptlang.org/) to make development easier and comes with pre-configured settings for [VS Code](https://code.visualstudio.com/) and ESLint. If you are using VS Code install these extensions:
-
-- [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint)
-
-### Install Development Dependencies
-
-Using a terminal, navigate to the project folder and run this command to install the development dependencies:
-
-```shell
-npm install
+```sh
+npm ci --ignore-scripts --no-audit --no-fund
+npm run lint
+npm run typecheck
+npm test
 ```
 
-### Update package.json
+`npm test` builds the TypeScript source and runs Node's built-in test runner.
+`npm run build` builds separately; `npm run test:offline` runs tests against
+the existing build. Tests use a mocked Homebridge API and synthetic values.
+They require no credentials, internet, broker, physical box or running Homebridge.
+Dependencies must already be installed; installation itself may need registry access.
 
-Open the [`package.json`](./package.json) and change the following attributes:
+Lifecycle scripts are disabled during dependency installation because this
+foundation needs none. There is no linking or automatic Homebridge launch script.
+Validation never runs dependency fixes.
 
-- `name` - this should be prefixed with `homebridge-` or `@username/homebridge-`, is case-sensitive, and contains no spaces nor special characters apart from a dash `-`
-- `displayName` - this is the "nice" name displayed in the Homebridge UI
-- `homepage` - link to your GitHub repo's `README.md`
-- `repository.url` - link to your GitHub repo
-- `bugs.url` - link to your GitHub repo issues page
-- `keywords` - the template ships with `homebridge-plugin` (required) and `supports-hap` (the plugin publishes accessories over HAP, which template-based plugins do). Add `supports-matter` if your plugin also registers Matter accessories itself — see the [Matter Plugins](https://github.com/homebridge/homebridge/wiki/Matter-Plugins) wiki page
+CI validates current Node 22/24 and separately tests compiled output on Node
+22.10.0 and 24.0.0. Linux validation in a dedicated browser-based GitHub Codespace
+remains the authoritative development gate; a Windows pass is reported separately.
+Windows and Codespaces do not share filesystems: transfers require matching Git
+baselines, a reviewed patch and file-integrity checks.
 
-When you are ready to publish the plugin you should set `private` to false, or remove the attribute entirely.
+Text files use LF through `.gitattributes`; no global Git setting is required.
 
-### Update Plugin Defaults
+## Protocol evidence and scope
 
-Open the [`src/settings.ts`](./src/settings.ts) file and change the default values:
+Read [the complete physical PoC handover](docs/toniebox-poc-handover.md), including
+**DO NOT RETEST**, before implementing communications. Its verified physical
+results must not be replaced with assumptions or repeated live experiments.
 
-- `PLATFORM_NAME` - Set this to be the name of your platform. This is the name of the platform that users will use to register the plugin in the Homebridge `config.json`.
-- `PLUGIN_NAME` - Set this to be the same name you set in the [`package.json`](./package.json) file.
+The approved later foundation uses memory-only rotating tokens, event-driven
+MQTT state and per-topic snapshots. Healthy MQTT sessions survive token refresh.
+MQTT.js will own reconnection. Device support follows capability evidence;
+Classic and Lite behaviour must not be guessed.
 
-Open the [`config.schema.json`](./config.schema.json) file and change the following attribute:
+The sequence is project cleanup, state/parsers, authentication, discovery, MQTT,
+then coordination. Commands and HomeKit accessory design are outside Phase 1.
 
-- `pluginAlias` - set this to match the `PLATFORM_NAME` you defined in the previous step.
+Never put credentials, tokens or personal account/device/content identifiers in
+logs, test fixtures or diagnostic reports. Use synthetic fixtures.
 
-See the [Homebridge API docs](https://developers.homebridge.io/#/config-screen/schema#default-values) for more details on the other attributes you can set in the `config.schema.json` file.
-
-### Build Plugin
-
-TypeScript needs to be compiled into JavaScript before it can run. The following command will compile the contents of your [`src`](./src) directory and put the resulting code into the `dist` folder.
-
-```shell
-npm run build
-```
-
-### Link To Homebridge
-
-Run this command so your global installation of Homebridge can discover the plugin in your development environment:
-
-```shell
-npm link
-```
-
-You can now start Homebridge, use the `-D` flag, so you can see debug log messages in your plugin:
-
-```shell
-homebridge -D
-```
-
-### Watch For Changes and Build Automatically
-
-If you want to have your code compile automatically as you make changes, and restart Homebridge automatically between changes, you first need to add your plugin as a platform in `./test/hbConfig/config.json`:
-```
-{
-...
-    "platforms": [
-        {
-            "name": "Config",
-            "port": 8581,
-            "platform": "config"
-        },
-        {
-            "name": "<PLUGIN_NAME>",
-            //... any other options, as listed in config.schema.json ...
-            "platform": "<PLATFORM_NAME>"
-        }
-    ]
-}
-```
-
-and then you can run:
-
-```shell
-npm run watch
-```
-
-This will launch an instance of Homebridge in debug mode which will restart every time you make a change to the source code. It will load the config stored in the default location under `~/.homebridge`. You may need to stop other running instances of Homebridge while using this command to prevent conflicts. You can adjust the Homebridge startup command in the [`nodemon.json`](./nodemon.json) file.
-
-### Customise Plugin
-
-You can now start customising the plugin template to suit your requirements.
-
-- [`src/platform.ts`](./src/platform.ts) - this is where your device setup and discovery should go.
-- [`src/platformAccessory.ts`](./src/platformAccessory.ts) - this is where your accessory control logic should go, you can rename or create multiple instances of this file for each accessory type you need to implement as part of your platform plugin. You can refer to the [developer documentation](https://developers.homebridge.io/) to see what characteristics you need to implement for each service type.
-- [`config.schema.json`](./config.schema.json) - update the config schema to match the config you expect from the user. See the [Plugin Config Schema Documentation](https://developers.homebridge.io/#/config-screen/schema).
-
-### Versioning Your Plugin
-
-Given a version number `MAJOR`.`MINOR`.`PATCH`, such as `1.4.3`, increment the:
-
-1. **MAJOR** version when you make breaking changes to your plugin,
-2. **MINOR** version when you add functionality in a backwards compatible manner, and
-3. **PATCH** version when you make backwards compatible bug fixes.
-
-You can use the `npm version` command to help you with this:
-
-```shell
-# major update / breaking changes
-npm version major
-
-# minor update / new features
-npm version update
-
-# patch / bugfixes
-npm version patch
-```
-
-### Publish Package
-
-When you are ready to publish your plugin to [npm](https://www.npmjs.com/), make sure you have removed the `private` attribute from the [`package.json`](./package.json) file then run:
-
-```shell
-npm publish
-```
-
-If you are publishing a scoped plugin, i.e. `@username/homebridge-xxx` you will need to add `--access=public` to command the first time you publish.
-
-#### Publishing Beta Versions
-
-You can publish *beta* versions of your plugin for other users to test before you release it to everyone.
-
-```shell
-# create a new pre-release version (eg. 2.1.0-beta.1)
-npm version prepatch --preid beta
-
-# publish to @beta
-npm publish --tag beta
-```
-
-Users can then install the  *beta* version by appending `@beta` to the install command, for example:
-
-```shell
-sudo npm install -g homebridge-example-plugin@beta
-```
-
-### Best Practices
-
-Consider creating your plugin with the [Homebridge Verified](https://github.com/homebridge/plugins) criteria in mind. This will help you to create a plugin that is easy to use and works well with Homebridge.
-You can then submit your plugin to the Homebridge Verified list for review.
-The most up-to-date criteria can be found on the [Verified Plugins](https://github.com/homebridge/plugins/wiki/Verified-Plugins) wiki page.
-
-### Useful Links
-
-Note these links are here for help but are not supported/verified by the Homebridge team
-
-- [Custom Characteristics](https://github.com/homebridge/homebridge-plugin-template/issues/20)
+Stop for review after each approved increment. Commits, pushes, pull requests,
+publication and Raspberry Pi deployment require separate maintainer approval.
