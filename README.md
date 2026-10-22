@@ -1,21 +1,49 @@
 # homebridge-toniebox
 
-Homebridge plugin for Toniebox devices, currently in development.
+A Homebridge plugin in development, aiming to bring Toniebox devices into Apple Home.
 
-Increment 1 provides an inert platform shell and offline validation. It does not
-authenticate with Tonies, discover devices, connect to MQTT, create accessories,
-or control a Toniebox. Do not install it on a production Homebridge instance yet.
-The package remains private.
+> 🚧 **Early development — not ready for installation.**
+>
+> This project is currently establishing its foundations. Toniebox integration and HomeKit accessories are not yet implemented.
+
+## Project Status
+
+**Increment 1 — Foundation: Complete ✅**
+
+The initial foundation includes:
+
+- A minimal Homebridge dynamic platform.
+- Cleanup of unused template code and dependencies.
+- Automated offline tests for platform registration and lifecycle behaviour.
+- Validation across Node.js 22 and 24.
+
+The plugin does not currently authenticate with Tonies, discover devices, connect to MQTT, create HomeKit accessories or control a Toniebox.
+
+## Development Roadmap
+
+Development will progress incrementally through:
+
+1. **Foundation** — Project setup, cleanup and validation. ✅
+2. **State Management** — MQTT topic parsing and device-state modelling.
+3. **Authentication** — Tonies Cloud authentication and token management.
+4. **Device Discovery** — Household and Toniebox discovery.
+5. **MQTT Integration** — Event-driven device communication.
+6. **Integration** — Bringing the components together.
+
+HomeKit accessories and device controls will follow once the underlying integration is sufficiently mature.
+
+Initial protocol research has been carried out using a **Toniebox 2**. Support for other models, including Toniebox Classic and Lite, will depend on verified capabilities and testing.
 
 ## Development
 
-Use a dedicated checkout and development branch. The runtime targets remain
-Node.js `^22.10.0 || ^24.0.0` and Homebridge `^1.8.0 || ^2.0.0`.
+The project currently targets:
 
-Use current Node.js 22 (at least 22.13 for ESLint) or 24 for development; Node 24
-is recommended. The development Homebridge types currently come from 2.x.
-The mocked platform tests do not establish full Homebridge 1.x/2.x integration
-compatibility.
+- **Node.js:** `^22.10.0 || ^24.0.0`
+- **Homebridge:** `^1.8.0 || ^2.0.0`
+
+Node.js 24 is recommended for development. Node.js 22.13.0 or newer is required for the current ESLint tooling.
+
+To build and validate locally:
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
@@ -24,40 +52,24 @@ npm run typecheck
 npm test
 ```
 
-`npm test` builds the TypeScript source and runs Node's built-in test runner.
-`npm run build` builds separately; `npm run test:offline` runs tests against
-the existing build. Tests use a mocked Homebridge API and synthetic values.
-They require no credentials, internet, broker, physical box or running Homebridge.
-Dependencies must already be installed; installation itself may need registry access.
+Tests use mocked Homebridge interfaces and synthetic data. No Toniebox, account credentials or running Homebridge instance is required.
 
-Lifecycle scripts are disabled during dependency installation because this
-foundation needs none. There is no linking or automatic Homebridge launch script.
-Validation never runs dependency fixes.
+Compatibility testing against running Homebridge 1.x and 2.x installations is still pending.
 
-CI validates current Node 22/24 and separately tests compiled output on Node
-22.10.0 and 24.0.0. Linux validation in a dedicated browser-based GitHub Codespace
-remains the authoritative development gate; a Windows pass is reported separately.
-Windows and Codespaces do not share filesystems: transfers require matching Git
-baselines, a reviewed patch and file-integrity checks.
+## Protocol Research
 
-Text files use LF through `.gitattributes`; no global Git setting is required.
+The project builds on an initial physical proof of concept exploring Tonies Cloud authentication, device discovery and MQTT communication.
 
-## Protocol evidence and scope
+The findings and implementation considerations are documented in the [Toniebox PoC handover](docs/toniebox-poc-handover.md).
 
-Read [the complete physical PoC handover](docs/toniebox-poc-handover.md), including
-**DO NOT RETEST**, before implementing communications. Its verified physical
-results must not be replaced with assumptions or repeated live experiments.
+## Contributing and Testing
 
-The approved later foundation uses memory-only rotating tokens, event-driven
-MQTT state and per-topic snapshots. Healthy MQTT sessions survive token refresh.
-MQTT.js will own reconnection. Device support follows capability evidence;
-Classic and Lite behaviour must not be guessed.
+The project is in early development, but interest, feedback and future beta testing are welcome.
 
-The sequence is project cleanup, state/parsers, authentication, discovery, MQTT,
-then coordination. Commands and HomeKit accessory design are outside Phase 1.
+If you own a Toniebox and would like to follow development or help test future releases, watch this repository for updates.
 
-Never put credentials, tokens or personal account/device/content identifiers in
-logs, test fixtures or diagnostic reports. Use synthetic fixtures.
+**Please do not share account credentials, authentication tokens or personal device identifiers in issues or discussions.**
 
-Stop for review after each approved increment. Commits, pushes, pull requests,
-publication and Raspberry Pi deployment require separate maintainer approval.
+---
+
+*This is an independent, unofficial project and is not affiliated with or endorsed by tonies®.*
