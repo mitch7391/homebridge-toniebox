@@ -9,12 +9,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mitch7391/homebridge-toniebox/actions/workflows/build.yml">
-    <img src="https://github.com/mitch7391/homebridge-toniebox/actions/workflows/build.yml/badge.svg?branch=latest" alt="Build Status">
-  </a>
-  <a href="./LICENSE">
-    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
-  </a>
+  <a href="https://github.com/mitch7391/homebridge-toniebox/actions/workflows/build.yml"><img src="https://github.com/mitch7391/homebridge-toniebox/actions/workflows/build.yml/badge.svg?branch=latest" alt="Build Status"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
+  <a href="https://www.paypal.com/donate/?business=FWN5P4BP7NJT4&amp;no_recurring=1&amp;item_name=Shout+me+a+coffee+%3A%29&amp;currency_code=AUD"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-orange" alt="Buy Me a Coffee"></a>
 </p>
 
 > [!IMPORTANT]
