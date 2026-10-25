@@ -65,13 +65,23 @@ The plugin can interpret seven documented MQTT state topics and maintain a local
 
 This also includes safeguards for retained MQTT messages, reconnecting sessions and stale device information.
 
-The foundation and state-handling components currently pass **34 automated offline tests**.
+### ✅ Increment 3A - Authentication Client (Complete)
 
-### Increment 3 - Authentication (Next)
+The first part of the Tonies Cloud authentication system is now implemented.
 
-The next step is building the authentication layer for Tonies Cloud.
+A standalone authentication client supports signing in with account credentials and renewing access through refresh tokens. It includes validation of authentication responses, safe handling of token rotation, request timeouts and cancellation, and safeguards against exposing sensitive information.
 
-This will cover initial authentication, access-token renewal, refresh-token rotation and handling authentication failures, with particular attention to privacy and security.
+Importantly, this is still an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, store tokens or communicate with a Toniebox.
+
+The project now passes **68 automated offline tests**, including 34 new tests covering authentication.
+
+### Increment 3B - Token Lifecycle Management (Next)
+
+The next step is building the system that manages authentication tokens throughout a running session.
+
+This will introduce in-memory token management, expiry tracking, coordinated token renewal and controlled recovery from authentication failures.
+
+The aim is to keep authentication reliable without unnecessary requests or exposing account credentials and tokens.
 
 ## Roadmap
 
@@ -80,6 +90,8 @@ Here's the current plan for development:
 - [x] **Increment 1:** Homebridge foundation
 - [x] **Increment 2:** MQTT parsing and device-state management
 - [ ] **Increment 3:** Authentication and token lifecycle
+  - [x] **3A:** Stateless authentication client
+  - [ ] **3B:** Token lifecycle management
 - [ ] **Increment 4:** Household and device discovery
 - [ ] **Increment 5:** MQTT connectivity and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
