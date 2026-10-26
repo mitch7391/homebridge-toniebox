@@ -73,7 +73,7 @@ A standalone authentication client supports signing in with account credentials 
 
 Importantly, this is still an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, store tokens or communicate with a Toniebox.
 
-The project now passes **68 automated offline tests**, including 34 new tests covering authentication.
+At the completion of Increment 3A, the project passed **68 automated offline tests**, including 34 new tests covering authentication.
 
 ### ✅ Increment 3B - Token Lifecycle Management (Complete)
 
@@ -93,7 +93,7 @@ Here's the current plan for development:
 
 - [x] **Increment 1:** Homebridge foundation
 - [x] **Increment 2:** MQTT parsing and device-state management
-- [ ] **Increment 3:** Authentication and token lifecycle
+- [x] **Increment 3:** Authentication and token lifecycle
   - [x] **3A:** Stateless authentication client
   - [x] **3B:** Token lifecycle management
 - [ ] **Increment 4:** Household and device discovery
