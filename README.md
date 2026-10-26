@@ -73,15 +73,19 @@ A standalone authentication client supports signing in with account credentials 
 
 Importantly, this is still an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, store tokens or communicate with a Toniebox.
 
-The project now passes **68 automated offline tests**, including 34 new tests covering authentication.
+At the completion of Increment 3A, the project passed **68 automated offline tests**, including 34 new tests covering authentication.
 
-### Increment 3B - Token Lifecycle Management (Next)
+### ✅ Increment 3B - Token Lifecycle Management (Complete)
 
-The next step is building the system that manages authentication tokens throughout a running session.
+The second part of the Tonies Cloud authentication system is now implemented.
 
-This will introduce in-memory token management, expiry tracking, coordinated token renewal and controlled recovery from authentication failures.
+An account-scoped token manager handles authentication tokens in memory, tracks expiry, and coordinates login and token renewal without unnecessary requests. It supports proactive and on-demand renewal, safe refresh-token rotation, and controlled recovery from temporary connection or authentication failures.
 
-The aim is to keep authentication reliable without unnecessary requests or exposing account credentials and tokens.
+The manager also protects against overlapping authentication requests, stale responses, excessive retries and accidental exposure of sensitive information.
+
+Like Increment 3A, this remains an independent component. It is not yet connected to the Homebridge platform, does not automatically communicate with Tonies Cloud, and does not persist authentication tokens across restarts.
+
+The project now passes **140 automated offline tests**, including **72 new tests** covering token lifecycle management.
 
 ## Roadmap
 
@@ -89,9 +93,9 @@ Here's the current plan for development:
 
 - [x] **Increment 1:** Homebridge foundation
 - [x] **Increment 2:** MQTT parsing and device-state management
-- [ ] **Increment 3:** Authentication and token lifecycle
+- [x] **Increment 3:** Authentication and token lifecycle
   - [x] **3A:** Stateless authentication client
-  - [ ] **3B:** Token lifecycle management
+  - [x] **3B:** Token lifecycle management
 - [ ] **Increment 4:** Household and device discovery
 - [ ] **Increment 5:** MQTT connectivity and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
