@@ -1,3 +1,4 @@
+
 <p align="center">
   <img src="docs/assets/homebridge-toniebox-logo.png" alt="Homebridge Toniebox" width="260">
 </p>
@@ -87,6 +88,18 @@ Like Increment 3A, this remains an independent component. It is not yet connecte
 
 The project now passes **140 automated offline tests**, including **72 new tests** covering token lifecycle management.
 
+### ✅ Increment 4A - Stateless REST Discovery Client (Complete)
+
+The first part of household and device discovery is now implemented.
+
+A standalone REST client supports retrieving account information, enumerating households and discovering Tonieboxes. It validates responses defensively, preserves valid devices when other records are malformed, and retains unfamiliar device models, generations and capabilities.
+
+The client also identifies ambiguous device routing information, supports request timeouts and cancellation, and provides privacy-safe error handling.
+
+Like the earlier components, discovery is not yet integrated with the Homebridge platform or token manager. The plugin does not automatically discover devices or establish live Toniebox connectivity.
+
+The project now passes **211 automated offline tests**, including **71 new tests** covering REST discovery.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -97,6 +110,8 @@ Here's the current plan for development:
   - [x] **3A:** Stateless authentication client
   - [x] **3B:** Token lifecycle management
 - [ ] **Increment 4:** Household and device discovery
+  - [x] **4A:** Stateless REST discovery client
+  - [ ] **4B:** Token-managed discovery orchestration
 - [ ] **Increment 5:** MQTT connectivity and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
 - [ ] **Future:** HomeKit accessories and controls
@@ -166,6 +181,8 @@ Before developing the plugin, I carried out an extensive proof of concept using 
 The results have been documented in the [Toniebox Proof of Concept Handover](docs/toniebox-poc-handover.md).
 
 This provides the technical foundation for future development and helps avoid repeating experiments that have already been completed.
+
+The [Discovery API Evidence](docs/discovery-api-evidence.md) also records the observed REST discovery behaviour, implementation decisions and remaining API uncertainties.
 
 Initial development is focused on **Toniebox 2**. Compatibility with other generations will require additional verification.
 
