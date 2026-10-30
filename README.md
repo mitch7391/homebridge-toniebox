@@ -96,9 +96,25 @@ A standalone REST client supports retrieving account information, enumerating ho
 
 The client also identifies ambiguous device routing information, supports request timeouts and cancellation, and provides privacy-safe error handling.
 
-Like the earlier components, discovery is not yet integrated with the Homebridge platform or token manager. The plugin does not automatically discover devices or establish live Toniebox connectivity.
+The REST client itself remains stateless, while the separate Increment 4B runner now combines it with token management. Neither component is connected to the Homebridge platform, so the plugin does not automatically discover devices or establish live Toniebox connectivity.
 
-The project now passes **211 automated offline tests**, including **71 new tests** covering REST discovery.
+At the completion of Increment 4A, the project passed **211 automated offline tests**, including **71 new tests** covering REST discovery.
+
+### ✅ Increment 4B - Token-Managed Discovery Orchestration (Complete)
+
+The second part of household and device discovery is now implemented.
+
+A standalone discovery runner brings together the existing token manager and REST discovery client, allowing account information, households and Tonieboxes to be discovered through a coordinated process.
+
+Each discovery run uses a single access token, retrieves household and device information sequentially, and operates within defined time limits. It also handles temporary connection failures conservatively, respects cloud rate limits, and preserves partial discovery results when enumeration cannot be completed.
+
+Additional safeguards protect against overlapping discovery operations, outdated responses, duplicate device identities and ambiguous routing information. Cancellation and shutdown are handled without allowing previous discovery results to affect a new account session.
+
+The discovery runner remains an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, discover Tonieboxes, establish MQTT connections or create HomeKit accessories.
+
+The project now passes **331 automated offline tests**, including **120 new tests** covering discovery orchestration.
+
+This completes Increment 4, establishing the foundation for account-scoped household and device discovery ahead of live MQTT connectivity.
 
 ## Roadmap
 
@@ -109,9 +125,9 @@ Here's the current plan for development:
 - [x] **Increment 3:** Authentication and token lifecycle
   - [x] **3A:** Stateless authentication client
   - [x] **3B:** Token lifecycle management
-- [ ] **Increment 4:** Household and device discovery
+- [x] **Increment 4:** Household and device discovery
   - [x] **4A:** Stateless REST discovery client
-  - [ ] **4B:** Token-managed discovery orchestration
+  - [x] **4B:** Token-managed discovery orchestration
 - [ ] **Increment 5:** MQTT connectivity and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
 - [ ] **Future:** HomeKit accessories and controls
