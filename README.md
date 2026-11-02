@@ -1,4 +1,3 @@
-
 <p align="center">
   <img src="docs/assets/homebridge-toniebox-logo.png" alt="Homebridge Toniebox" width="260">
 </p>
@@ -116,6 +115,20 @@ The project now passes **331 automated offline tests**, including **120 new test
 
 This completes Increment 4, establishing the foundation for account-scoped household and device discovery ahead of live MQTT connectivity.
 
+### ✅ Increment 5A - Guarded MQTT Transport and Subscriptions (Complete)
+
+The first part of live MQTT connectivity is now implemented.
+
+A standalone MQTT v5 transport supports authenticated, secure WebSocket connections to Tonies Cloud and subscribes to the seven documented state topics for each approved Toniebox. It validates connection and subscription acknowledgements before reporting readiness, preserves early messages within defined limits, and handles timeouts, cancellation and cleanup.
+
+Additional safeguards protect against oversized MQTT packets before decoding, excessive payloads and uncontrolled message buffering. Automatic reconnection, resubscription and command publishing remain disabled.
+
+The transport remains an independent component and is not yet connected to the Homebridge platform or the token manager. Increment 5B will introduce token-managed connection lifecycle and reconnection handling.
+
+The project now passes **432 automated offline tests**, including **101 new tests** covering MQTT transport and subscriptions. Testing also passed on Linux across the supported Node.js versions.
+
+**Diagnostic logging and privacy:** The transport avoids exposing sensitive information in normal diagnostic logs. A known limitation in the underlying MQTT library means dynamically enabled low-level packet tracing may include private connection or device information in process logs. Avoid enabling MQTT packet tracing and review logs before sharing them. An upstream improvement is being tracked in [mqtt-packet issue #165](https://github.com/mqttjs/mqtt-packet/issues/165).
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -129,6 +142,8 @@ Here's the current plan for development:
   - [x] **4A:** Stateless REST discovery client
   - [x] **4B:** Token-managed discovery orchestration
 - [ ] **Increment 5:** MQTT connectivity and reconnection
+  - [x] **5A:** Guarded MQTT transport and subscriptions
+  - [ ] **5B:** Token-managed connection lifecycle and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
 - [ ] **Future:** HomeKit accessories and controls
 - [ ] **Future:** Beta testing and refinement
