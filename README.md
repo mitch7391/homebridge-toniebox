@@ -123,11 +123,25 @@ A standalone MQTT v5 transport supports authenticated, secure WebSocket connecti
 
 Additional safeguards protect against oversized MQTT packets before decoding, excessive payloads and uncontrolled message buffering. Automatic reconnection, resubscription and command publishing remain disabled.
 
-The transport remains an independent component and is not yet connected to the Homebridge platform or the token manager. Increment 5B will introduce token-managed connection lifecycle and reconnection handling.
+The transport itself remains standalone and is not connected directly to Homebridge or the token manager. Increment 5B now composes it with the token manager, while Homebridge integration remains future work.
 
 The project now passes **432 automated offline tests**, including **101 new tests** covering MQTT transport and subscriptions. Testing also passed on Linux across the supported Node.js versions.
 
 **Diagnostic logging and privacy:** The transport avoids exposing sensitive information in normal diagnostic logs. A known limitation in the underlying MQTT library means dynamically enabled low-level packet tracing may include private connection or device information in process logs. Avoid enabling MQTT packet tracing and review logs before sharing them. An upstream improvement is being tracked in [mqtt-packet issue #165](https://github.com/mqttjs/mqtt-packet/issues/165).
+
+### ✅ Increment 5B - Token-Managed MQTT Lifecycle and Reconnection (Complete)
+
+The second part of MQTT connectivity is now implemented.
+
+A standalone MQTT lifecycle component coordinates the existing token manager and guarded MQTT transport. It acquires usable access tokens for each connection attempt and automatically reconnects after temporary failures using bounded backoff and jitter. Healthy connections are not interrupted merely because their authentication tokens are renewed.
+
+The lifecycle also manages MQTT session generations, protects against stale callbacks and messages, and handles cancellation, shutdown and connection failures conservatively. Definitive MQTT authentication refusal requires attention rather than repeatedly retrying rejected credentials.
+
+This remains an independent backend component. It is not yet connected to the Homebridge platform, and the plugin does not automatically discover Tonieboxes, establish live connections or create HomeKit accessories.
+
+The project now passes **571 automated offline tests**, including **139 new tests** covering MQTT lifecycle management and reconnection. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
+
+This completes Increment 5, providing the foundation for reliable MQTT connectivity ahead of backend integration.
 
 ## Roadmap
 
@@ -141,10 +155,13 @@ Here's the current plan for development:
 - [x] **Increment 4:** Household and device discovery
   - [x] **4A:** Stateless REST discovery client
   - [x] **4B:** Token-managed discovery orchestration
-- [ ] **Increment 5:** MQTT connectivity and reconnection
+- [x] **Increment 5:** MQTT connectivity and reconnection
   - [x] **5A:** Guarded MQTT transport and subscriptions
-  - [ ] **5B:** Token-managed connection lifecycle and reconnection
+  - [x] **5B:** Token-managed connection lifecycle and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
+  - [ ] **6A:** Device routing and state integration
+  - [ ] **6B:** Account coordination and lifecycle management
+  - [ ] **6C:** Homebridge platform integration
 - [ ] **Future:** HomeKit accessories and controls
 - [ ] **Future:** Beta testing and refinement
 
