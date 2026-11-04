@@ -143,6 +143,24 @@ The project now passes **571 automated offline tests**, including **139 new test
 
 This completes Increment 5, providing the foundation for reliable MQTT connectivity ahead of backend integration.
 
+### ✅ Increment 6A - Device Routing and State Integration (Complete)
+
+The first part of backend integration is now implemented.
+
+A standalone routing and compatibility layer determines which discovered Tonieboxes are eligible for MQTT connectivity. The initial compatibility profile supports Toniebox 2 based on the documented reference-device evidence, while Toniebox Classic and Lite remain unverified and require explicit experimental authorisation before testing.
+
+Route approval validates account identity, household association, device identifiers, MAC addresses and compatibility evidence. Experimental devices are isolated from established production routing to avoid compromising known-good connections.
+
+Route reconciliation also protects existing connections against temporary discovery failures and incomplete metadata. Previously approved devices can retain last-known routing authority when there is no confirmed reason to disconnect them, while explicit restrictions, account invalidation, identity conflicts and authoritative device absence remain effective.
+
+A separate backend-state adapter integrates MQTT lifecycle events with the existing device-state model. It protects against stale sessions and callbacks, preserves valid state across reconnects, and exposes connection and attention-required status for future backend coordination.
+
+These components remain independent of the Homebridge platform. They do not automatically authenticate, discover devices, establish MQTT connections or create HomeKit accessories.
+
+The project now passes **775 automated offline tests**, including **204 new tests** covering device routing, compatibility, reconciliation and backend-state integration. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
+
+Increment 6B will connect these standalone components through an account coordinator, followed by Homebridge platform integration in Increment 6C.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -159,7 +177,7 @@ Here's the current plan for development:
   - [x] **5A:** Guarded MQTT transport and subscriptions
   - [x] **5B:** Token-managed connection lifecycle and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
-  - [ ] **6A:** Device routing and state integration
+  - [x] **6A:** Device routing and state integration
   - [ ] **6B:** Account coordination and lifecycle management
   - [ ] **6C:** Homebridge platform integration
 - [ ] **Future:** HomeKit accessories and controls
