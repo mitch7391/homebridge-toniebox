@@ -161,6 +161,26 @@ The project now passes **775 automated offline tests**, including **204 new test
 
 Increment 6B will connect these standalone components through an account coordinator, followed by Homebridge platform integration in Increment 6C.
 
+### ✅ Increment 6B - Account Coordination and Lifecycle Management (Complete)
+
+The second part of backend integration is now implemented.
+
+A standalone account coordinator brings together the existing authentication, discovery, routing, MQTT lifecycle and device-state components. It manages account credentials, coordinates discovery and controls authorised MQTT connections without duplicating the responsibilities of the underlying components.
+
+Account-context isolation protects against outdated discovery results, stale MQTT callbacks and credential changes. Previously authorised production connections can remain operational during temporary discovery failures, while confirmed account, routing and compatibility changes invalidate obsolete authority.
+
+The coordinator also preserves cloud rate-limit cooldowns across context replacements and avoids unnecessary MQTT restarts when device routing remains unchanged.
+
+Experimental Toniebox models are managed through separate connections and state adapters, isolated from production devices. A conservative limit of four experimental connections per account prevents uncontrolled resource consumption without arbitrarily selecting devices from an oversized set.
+
+Privacy-safe diagnostics expose connection status, discovery health and conditions requiring attention without revealing account credentials, tokens or private device identifiers.
+
+The coordinator remains independent of the Homebridge platform. Discovery is explicitly requested, and no HomeKit accessories or device commands are implemented yet.
+
+The project now passes **827 automated offline tests**, including **52 new tests** covering account coordination, credential transitions, discovery recovery, routing lifecycle management and experimental isolation. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
+
+This completes Increment 6B. Increment 6C will connect the standalone backend to Homebridge, including configuration, startup and shutdown handling.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -178,7 +198,7 @@ Here's the current plan for development:
   - [x] **5B:** Token-managed connection lifecycle and reconnection
 - [ ] **Increment 6:** Backend coordination and integration
   - [x] **6A:** Device routing and state integration
-  - [ ] **6B:** Account coordination and lifecycle management
+  - [x] **6B:** Account coordination and lifecycle management
   - [ ] **6C:** Homebridge platform integration
 - [ ] **Future:** HomeKit accessories and controls
 - [ ] **Future:** Beta testing and refinement
