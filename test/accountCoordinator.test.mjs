@@ -421,3 +421,140 @@ for (const lane of ['production', 'experimental']) {
     assert.equal(f.c.getDevice('SYNTHETIC_A', lane), undefined);
   });
 }
+
+
+async function finishRetry(f, pending) {
+  await drain();
+  const job = [...f.jobs].find(j => j.ms === 1000);
+  if (job) {
+    f.advance(1000); job.fn();
+  }
+  return pending;
+}
+for (const count of [0, 1]) {
+  test('recovery complete discovery including empty: ' + count, async () => {
+    const f = fixture(); f.boxes = count ? [box()] : [];
+    assert.deepEqual((await f.begin()).recovery, { disposition: 'none', reason: 'complete', coverage: 'complete' });
+  });
+}
+test('recovery successful incomplete enumeration is not an automatic retry', async () => {
+  const f = fixture(); f.boxesResult = { ...ok([box()]), diagnostics: { ...diagnostics, continuationDetected: true } };
+  const result = await f.begin(); assert.equal(result.ok, true);
+  assert.deepEqual(result.recovery, { disposition: 'none', reason: 'incomplete', coverage: 'partial' });
+});
+for (const error of [{ kind: 'transport' }, { kind: 'timeout' },
+  ...[408, 500, 502, 503, 504].map(status => ({ kind: 'http', status }))]) {
+  test('recovery transient ' + JSON.stringify(error), async () => {
+    const f = fixture(); f.accountResult = { ok: false, error };
+    const result = await finishRetry(f, f.begin());
+    assert.equal(result.recovery.disposition, 'retry'); assert.equal(result.recovery.reason, 'transient');
+    assert.equal(result.recovery.coverage, 'unknown'); assert.equal(result.reason, 'discovery');
+  });
+}
+for (const status of [429, 503]) {
+  for (const delay of [undefined, 120000]) {
+    test('recovery HTTP cooldown ' + status + '/' + delay, async () => {
+      const f = fixture(); f.accountResult = { ok: false, error: { kind: status === 429 ? 'rate-limited' : 'http', status,
+        ...(delay === undefined ? {} : { retryAfterMs: delay }) } };
+      const result = await finishRetry(f, f.begin());
+      assert.equal(result.recovery.disposition, 'retry');
+      assert.equal(result.recovery.minimumRetryDelayMs, delay ?? (status === 429 ? 60000 : undefined));
+      if (delay || status === 429) {
+        const next = await f.c.discover(); assert.equal(next.reason, 'cooldown');
+        assert.equal(next.recovery.minimumRetryDelayMs, delay ?? 60000);
+      }
+    });
+  }
+}
+test('recovery observed cooldown survives exact discovery deadline', async () => {
+  const f = fixture(), late = deferred(); f.accountResult = late.promise;
+  const pending = f.begin(); await drain(); f.advance(60000);
+  late.resolve({ ok: false, error: { kind: 'rate-limited', status: 429, retryAfterMs: 120000 } });
+  const result = await pending;
+  assert.equal(result.ok, false); assert.equal(result.recovery.disposition, 'retry');
+  assert.equal(result.recovery.minimumRetryDelayMs, 120000);
+  assert.equal((await f.c.discover()).recovery.minimumRetryDelayMs, 120000);
+});
+for (const [error, reason] of [[{ kind: 'unauthorized', status: 401 }, 'authentication'],
+  [{ kind: 'forbidden', status: 403 }, 'permission'], [{ kind: 'invalid-response' }, 'invalid-response'],
+  [{ kind: 'http', status: 400 }, 'dependency']]) {
+  test('recovery nonretryable ' + reason, async () => {
+    const f = fixture(); f.accountResult = { ok: false, error };
+    const result = await f.begin(); assert.equal(result.recovery.disposition, 'attention');
+    assert.equal(result.recovery.reason, reason);
+  });
+}
+for (const status of [401, 429]) {
+  test('recovery respects terminal token attention including auth rate limiting: ' + status, async () => {
+    const f = fixture(); f.authResult = { ok: false, error: { kind: 'http', status, oauthError: 'invalid_grant' } };
+    const result = await f.begin(); assert.equal(result.recovery.disposition, 'attention');
+    assert.equal(result.recovery.reason, 'authentication'); assert.equal(f.calls.includes('account'), false);
+  });
+}
+test('recovery temporary authentication backoff does not clear credentials', async () => {
+  const f = fixture(); f.authResult = { ok: false, error: { kind: 'transport' } };
+  const result = await f.begin(); assert.equal(result.recovery.disposition, 'retry');
+  assert.equal(result.recovery.minimumRetryDelayMs, 30000);
+  assert.equal((await f.c.discover()).recovery.minimumRetryDelayMs, 30000);
+  assert.equal(f.calls.filter(c => c === 'login').length, 1);
+});
+for (const action of ['clear', 'invalidate', 'stop', 'replace', 'cancel']) {
+  test('recovery abandoned operation ' + action, async () => {
+    const f = fixture(), late = deferred(), signal = new AbortController(); f.accountResult = late.promise;
+    f.c.setCredentials(credentials); f.c.start();
+    const pending = f.c.discover({ signal: signal.signal }); await drain();
+    if (action === 'replace') {
+      f.c.setCredentials({ ...credentials, password: 'SYNTHETIC_REPLACEMENT' });
+    } else if (action === 'cancel') {
+      signal.abort();
+    } else {
+      f.c[action]();
+    }
+    const result = await pending; assert.equal(result.recovery.disposition, 'none');
+    late.resolve(ok(f.account)); await drain();
+    if (action !== 'cancel') {
+      assert.equal(f.lifecycles.length, 0);
+    }
+  });
+}
+test('recovery metadata is detached per shared waiter and private', async () => {
+  const f = fixture(), late = deferred(); f.accountResult = late.promise;
+  f.c.setCredentials(credentials); f.c.start(); const a = f.c.discover(), b = f.c.discover();
+  late.resolve(ok(f.account)); const [one, two] = await Promise.all([a, b]);
+  one.recovery.coverage = 'unknown'; assert.equal(two.recovery.coverage, 'complete');
+  assert.doesNotMatch(JSON.stringify(two), /SYNTHETIC|token|macAddress|household/i);
+});
+test('recovery malformed dependency is attention without private error data', async () => {
+  const f = fixture(); f.accountResult = { private: 'SYNTHETIC_SECRET' };
+  const result = await f.begin(); assert.equal(result.recovery.disposition, 'attention');
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC/);
+});
+test('recovery partial transient failure retains authorised production', async () => {
+  const f = fixture(); await f.begin(); f.message(); const old = f.lifecycles[0];
+  f.boxesResult = { ok: false, error: { kind: 'transport' } };
+  const result = await finishRetry(f, f.c.discover());
+  assert.equal(result.recovery.disposition, 'retry'); assert.equal(result.recovery.coverage, 'partial');
+  assert.equal(old.stops, 0); assert.equal(f.lifecycles.length, 1);
+  assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+});
+
+for (const lifetime of [300, 40]) {
+  test('recovery ' + (lifetime === 300 ? 'deadline' : 'token-expired') + ' without retry loop', async () => {
+    const f = fixture(), late = deferred();
+    f.authResult = { ok: true, tokens: { accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH',
+      tokenType: 'Bearer', expiresInSeconds: lifetime } };
+    f.accountResult = late.promise; const pending = f.begin(); await drain();
+    const job = [...f.jobs].find(j => j.ms === (lifetime === 300 ? 60000 : 39000));
+    assert.ok(job); f.advance(job.ms); job.fn();
+    const result = await pending; assert.equal(result.recovery.disposition, 'retry');
+    assert.equal(result.recovery.reason, lifetime === 300 ? 'deadline' : 'token-expired');
+    late.resolve(ok(f.account)); await drain(); assert.equal(f.calls.includes('households'), false);
+  });
+}
+for (const delay of [NaN, Infinity, -1, 10000000000]) {
+  test('recovery validates delay without timer truncation: ' + delay, async () => {
+    const f = fixture(); f.accountResult = { ok: false, error: { kind: 'rate-limited', status: 429, retryAfterMs: delay } };
+    const result = await f.begin();
+    assert.equal(result.recovery.minimumRetryDelayMs, delay === 10000000000 ? delay : 60000);
+  });
+}

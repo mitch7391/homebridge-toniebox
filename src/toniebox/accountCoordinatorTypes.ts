@@ -13,9 +13,19 @@ export type CoordinatorPhase = 'not-configured' | 'idle' | 'authentication-pendi
   | 'degraded' | 'connecting' | 'connected' | 'retrying' | 'attention-required' | 'invalidated' | 'stopped';
 export type CoordinatorFailure = 'invalid-input' | 'busy' | 'cancelled' | 'not-started' | 'not-configured'
   | 'invalidated' | 'stopped' | 'cooldown' | 'authentication' | 'discovery' | 'dependency' | 'clock-invalid';
-export type CoordinatorResult = { readonly ok: true } | {
+/** Advisory metadata for discover() only. Absence never authorises automatic retry. */
+export type DiscoveryRecoveryReason = 'complete' | 'incomplete' | 'transient' | 'rate-limited'
+  | 'authentication' | 'permission' | 'invalid-response' | 'deadline' | 'token-expired'
+  | 'cancelled' | 'invalidated' | 'stopped' | 'clock-invalid' | 'dependency' | 'not-ready';
+export type DiscoveryRecovery = {
+  readonly coverage: 'complete' | 'partial' | 'unknown';
+} & (
+  | { readonly disposition: 'retry'; readonly reason: DiscoveryRecoveryReason; readonly minimumRetryDelayMs?: number }
+  | { readonly disposition: 'attention' | 'none'; readonly reason: DiscoveryRecoveryReason }
+);
+export type CoordinatorResult = ({ readonly ok: true } | {
   readonly ok: false; readonly reason: CoordinatorFailure; readonly retryAfterMs?: number;
-};
+}) & { readonly recovery?: DiscoveryRecovery };
 /** Identifier-free snapshots. Private device observations are available only through getDevice(). */
 export interface CoordinatorStatus {
   readonly phase: CoordinatorPhase;

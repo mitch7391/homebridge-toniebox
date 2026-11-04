@@ -1,11 +1,13 @@
-import type { DynamicPlatformPlugin, Logging } from 'homebridge';
+import type { API, DynamicPlatformPlugin, Logging, PlatformConfig } from 'homebridge';
+import { PlatformRuntime } from './platformRuntime.js';
+import type { PlatformRuntimeOptions } from './platformRuntime.js';
 
-/**
- * Inert platform shell. Communications and accessory mapping follow separately.
- */
+/** Thin lifecycle adapter. Accessory support remains intentionally absent. */
 export class TonieboxPlatform implements DynamicPlatformPlugin {
-  constructor(log: Logging) {
-    log.info('Toniebox foundation loaded; device integration is not implemented yet.');
+  constructor(log: Logging, config: PlatformConfig, api: API, options: PlatformRuntimeOptions = {}) {
+    const runtime = new PlatformRuntime(config, log, options);
+    api.on('didFinishLaunching', () => runtime.launch());
+    api.on('shutdown', () => runtime.stop());
   }
 
   configureAccessory(): void {
