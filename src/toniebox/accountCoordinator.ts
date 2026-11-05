@@ -1,3 +1,4 @@
+import { CommissioningObserver } from './commissioning.js';
 import { performance } from 'node:perf_hooks';
 import { createAuthClient } from './authClient.js';
 import { createTokenManager } from './tokenManager.js';
@@ -81,6 +82,7 @@ const unavailable: DiscoveryRunResult = { ok: false, error: { kind: 'request' },
 
 class Coordinator implements AccountCoordinator {
   readonly #options: AccountCoordinatorOptions;
+  readonly #commissioning?: CommissioningObserver;
   readonly #clock: TokenClock;
   readonly #tokens: TokenManager;
   #context?: Context;
@@ -95,6 +97,9 @@ class Coordinator implements AccountCoordinator {
 
   constructor(options: AccountCoordinatorOptions) {
     this.#options = { ...options };
+    if (typeof options.onCommissioning === 'function') {
+      this.#commissioning = new CommissioningObserver(options.onCommissioning);
+    }
     this.#clock = options.clock ?? { now: () => ({ monotonicMs: performance.now(), wallMs: Date.now() }) };
     this.#tokens = createTokenManager({ authClient: options.authClient ?? createAuthClient(), clock: this.#clock, scheduler: options.scheduler });
     this.#policy = policyCopy(options.policy);
@@ -211,6 +216,7 @@ class Coordinator implements AccountCoordinator {
       this.#credentials = value;
       const c: Context = { key: Symbol(), controller: new AbortController(), experiments: new Map(), started: false };
       this.#context = c;
+      this.#commissioning?.reset();
       const client = this.#options.discoveryClient ?? createDiscoveryClient();
       const request = async <T>(invoke: () => Promise<DiscoveryResult<T>>, options?: DiscoveryRequestOptions): Promise<DiscoveryResult<T>> => {
         if (!this.#current(c) || options?.signal?.aborted) {
@@ -307,7 +313,11 @@ class Coordinator implements AccountCoordinator {
             }
             throw new Error('State contract');
           }
+          const newSession = status.phase === 'ready' && slot.status.session !== status.session;
           slot.status = status;
+          if (newSession && this.#commissioning) {
+            quiet(() => this.#commissioning!.session(plan.lane, () => live() && slot.status.session === status.session));
+          }
           this.#refresh(c); this.#notify();
         } catch {
           if (live()) {
@@ -317,7 +327,11 @@ class Coordinator implements AccountCoordinator {
       },
       onMessage: message => {
         if (live()) {
-          bound.binding.onMessage(message);
+          const applied = bound.binding.onMessage(message);
+          if (this.#commissioning && live()) {
+            quiet(() => this.#commissioning!.message(plan.lane, message, applied,
+              () => slot.state.getDevice(message.routeId), () => live() && slot.status.phase === 'ready' && slot.status.session === message.session));
+          }
         }
       },
     });
@@ -376,6 +390,10 @@ class Coordinator implements AccountCoordinator {
       if (!c.experiments.has(id)) {
         c.uuid = plan.accountUuid; c.experiments.set(id, this.#install(c, plan));
       }
+    }
+    if (this.#commissioning && this.#current(c)) {
+      quiet(() => this.#commissioning!.discovery(result, approval, c.production?.plan.routes.length ?? 0,
+        this.#policy, () => this.#current(c)));
     }
     // All slots/bindings are installed before any lifecycle can emit ready and buffered messages.
     for (const slot of this.#slots(c)) {

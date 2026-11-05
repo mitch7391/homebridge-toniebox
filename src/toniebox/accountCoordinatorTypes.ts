@@ -1,3 +1,4 @@
+import type { CommissioningObservation } from './commissioning.js';
 import type { AuthClient, AuthCredentials } from './authTypes.js';
 import type { DeviceObservation } from './backendState.js';
 import type { DiscoveryClient } from './discoveryTypes.js';
@@ -39,6 +40,8 @@ export interface CoordinatorStatus {
   readonly connections: readonly { readonly lane: 'production' | 'experimental'; readonly status: MqttLifecycleStatus }[];
 }
 export interface AccountCoordinatorOptions {
+  /** Explicit passive opt-in; receives only bounded, identifier-free projections. */
+  readonly onCommissioning?: (event: CommissioningObservation) => void;
   readonly authClient?: AuthClient;
   readonly discoveryClient?: DiscoveryClient;
   /** Trusted inert factory; callbacks must not begin until start(). */
