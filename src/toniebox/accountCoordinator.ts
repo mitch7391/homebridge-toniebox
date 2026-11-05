@@ -297,6 +297,9 @@ class Coordinator implements AccountCoordinator {
       throw new Error('Invalid binding');
     }
     const live = (): boolean => this.#current(c) && slot.active;
+    let previouslyReady = false;
+    let diagnosticTransition: object = {};
+    let diagnosticKey = '';
     const lifecycle = (this.#options.lifecycleFactory ?? createMqttLifecycle)({
       tokenProvider: this.#tokens, accountUuid: plan.accountUuid, routes: plan.routes, contextSignal: c.controller.signal,
       clock: { now: () => this.#now() }, scheduler: this.#options.scheduler,
@@ -315,6 +318,18 @@ class Coordinator implements AccountCoordinator {
           }
           const newSession = status.phase === 'ready' && slot.status.session !== status.session;
           slot.status = status;
+          if (this.#commissioning) {
+            quiet(() => {
+              previouslyReady ||= status.phase === 'ready';
+              const key = JSON.stringify([status.phase, status.session, status.error?.kind, status.error?.tokenFailure]);
+              if (key !== diagnosticKey) {
+                diagnosticKey = key;
+                const transition = diagnosticTransition = {};
+                this.#commissioning!.lifecycle(plan.lane, status, previouslyReady,
+                  () => live() && diagnosticTransition === transition);
+              }
+            });
+          }
           if (newSession && this.#commissioning) {
             quiet(() => this.#commissioning!.session(plan.lane, () => live() && slot.status.session === status.session));
           }

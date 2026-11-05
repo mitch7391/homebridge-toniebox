@@ -741,3 +741,59 @@ test('commissioning session establishments count independently per lane and rese
   const exhausted = events.length; assert.ok(exhausted <= 64);
   f.c.clear(); await f.begin(); await drain(); assert.equal(events.length, exhausted);
 });
+
+for (const phase of ['waiting-retry', 'attention-required']) {
+  test('commissioning post-ready lifecycle observation: ' + phase, async () => {
+    const events=[]; const f=fixture({ options:{ onCommissioning:e=>events.push(e) } }); await f.begin(); await drain();
+    const status={ phase, connected:false, error:{ kind:'transport', tokenFailure:'backoff', private:'SYNTHETIC_SECRET' } };
+    for(let i=0;i<100;i++) {
+      f.lifecycles[0].options.onStatus(status);
+    }
+    await drain(); const observed=events.filter(e=>e.kind==='lifecycle');
+    assert.deepEqual(observed,[{ kind:'lifecycle',lane:'production',previouslyReady:true,phase,failure:'transport' }]);
+    assert.equal(f.c.getStatus().connections[0].status.phase,phase);
+    assert.doesNotMatch(JSON.stringify(events),/SYNTHETIC|private/);
+  });
+}
+for (const error of [{ kind:'token',tokenFailure:'authentication-failed' }, { kind:'token',tokenFailure:'PRIVATE' },
+  { kind:'PRIVATE',tokenFailure:'backoff' }, undefined]) {
+  test('commissioning initial failure uses only existing sanitised categories ' + JSON.stringify(error), async () => {
+    const events=[];
+    const f=fixture({ options:{ onCommissioning:e=>events.push(e), lifecycleFactory:o=>({
+      getStatus:()=>({ phase:'idle',connected:false }),stop(){},start(){
+        o.onStatus({ phase:'attention-required',connected:false,error });
+      },
+    }) } });
+    await f.begin(); await drain(); const event=events.find(e=>e.kind==='lifecycle');
+    assert.equal(event.previouslyReady,false); assert.equal(event.phase,'attention-required');
+    assert.equal(event.failure,error?.kind==='token'?'token':undefined);
+    assert.equal(event.tokenFailure,error?.tokenFailure==='authentication-failed'?'authentication-failed':undefined);
+    assert.doesNotMatch(JSON.stringify(events),/PRIVATE|SYNTHETIC/);
+  });
+}
+test('commissioning lifecycle lanes stay separate and obsolete transitions never publish', async () => {
+  const events=[]; const policy={ rules:[{ product:'EXPERIMENT',generation:'GEN',family:'unknown',decision:'experimental',
+    protocol:'ici-seven-state-topics',evidence:'synthetic' }] };
+  const f=fixture({ options:{ policy,onCommissioning:e=>events.push(e) } });
+  f.boxes=[box(),box('EXP',{ product:'EXPERIMENT',generation:'GEN' })]; await f.begin(); await drain();
+  const failure={ phase:'attention-required',connected:false,error:{ kind:'authentication-refused' } };
+  f.lifecycles[1].options.onStatus(failure); await drain();
+  assert.equal(events.find(e=>e.kind==='lifecycle').lane,'experimental');
+  assert.equal(f.c.getStatus().connections.find(c=>c.lane==='production').status.phase,'ready');
+  const n=events.length; f.lifecycles[0].options.onStatus(failure); f.c.clear(); await drain();
+  f.lifecycles[0].options.onStatus(failure); await drain(); assert.equal(events.length,n);
+});
+test('commissioning lifecycle budget, supersession and observer exceptions are contained', async () => {
+  let attempts=0;const f=fixture({ options:{ onCommissioning:()=>{
+    attempts++;throw Error('SYNTHETIC');
+  } } });
+  await f.begin();await drain();const l=f.lifecycles[0];const n=attempts;
+  l.options.onStatus({ phase:'waiting-retry',connected:false,error:{ kind:'transport' } });
+  l.options.onStatus({ phase:'ready',connected:true,session:2 });await drain();assert.equal(attempts,n+1);
+  for(let i=0;i<100;i++) {
+    l.options.onStatus({ phase:'waiting-retry',connected:false,error:{ kind:i%2?'transport':'timeout' } });await drain();
+  }
+  assert.ok(attempts<=64);assert.equal(f.c.getStatus().connections[0].status.phase,'waiting-retry');
+  f.c.stop();const stopped=attempts;l.options.onStatus({ phase:'attention-required',connected:false });await drain();
+  assert.equal(attempts,stopped);assert.equal(f.jobs.size,0);
+});

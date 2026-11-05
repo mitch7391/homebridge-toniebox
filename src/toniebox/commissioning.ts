@@ -2,7 +2,7 @@ import type { DiscoveryRunResult } from './discoveryRunnerTypes.js';
 import type { RouteApproval, CompatibilityPolicy } from './routingTypes.js';
 import { assessCompatibility } from './routingPolicy.js';
 import type { IntegrationResult, DeviceObservation } from './backendState.js';
-import type { MqttSessionMessage } from './mqttLifecycleTypes.js';
+import type { MqttLifecycleStatus, MqttLifecycleFailure, MqttSessionMessage } from './mqttLifecycleTypes.js';
 
 /** Set true only in a separately approved commissioning build. Never read config or DEBUG. */
 export const COMMISSIONING_BUILD = false;
@@ -21,6 +21,8 @@ export type CommissioningObservation =
   | { kind: 'discovery'; coverage: 'complete' | 'partial' | 'unknown'; provenance: 'uuid' | 'unverified';
     households: number; devices: number; tb2Candidates: number; productionRoutes: number;
     exclusions: Record<typeof exclusions[number], number> }
+  | { kind: 'lifecycle'; lane: Lane; previouslyReady: boolean; phase: 'waiting-retry' | 'attention-required';
+    failure?: MqttLifecycleFailure['kind']; tokenFailure?: MqttLifecycleFailure['tokenFailure'] }
   | { kind: 'session'; lane: Lane; established: number }
   | { kind: 'messages'; lane: Lane; received: number; accepted: number; rejected: number;
     unchanged: number; changed: number; retained: number; live: number;
@@ -62,6 +64,15 @@ export class CommissioningObserver {
         const a = assessCompatibility(o.device, policy);
         return a.family === 'toniebox-2' && (a.kind === 'provisional' || a.kind === 'validated');
       }).length), exclusions: excluded }, current);
+  }
+  /** Input is the coordinator's existing allowlisted status, never a raw dependency object. */
+  lifecycle(lane: Lane, status: MqttLifecycleStatus, previouslyReady: boolean, current: () => boolean): void {
+    if (status.phase !== 'waiting-retry' && status.phase !== 'attention-required') {
+      return;
+    }
+    this.#emit({ kind: 'lifecycle', lane, previouslyReady, phase: status.phase,
+      ...(status.error ? { failure: status.error.kind } : {}),
+      ...(status.error?.kind === 'token' && status.error.tokenFailure ? { tokenFailure: status.error.tokenFailure } : {}) }, current);
   }
   session(lane: Lane, current: () => boolean): void {
     this.#sessions[lane] = count(this.#sessions[lane] + 1);
