@@ -14,7 +14,8 @@ import type { MqttLifecycle, MqttLifecycleStatus } from './mqttLifecycleTypes.js
 import type { ApprovedRoutePlan, CompatibilityPolicy } from './routingTypes.js';
 import type { TokenClock, TokenManager } from './tokenManagerTypes.js';
 import { MAX_EXPERIMENTAL_CONNECTIONS } from './accountCoordinatorTypes.js';
-import type { AccountCoordinator, AccountCoordinatorOptions, CoordinatorFailure, CoordinatorResult, CoordinatorStatus } from './accountCoordinatorTypes.js';
+import type { AccountCoordinator, AccountCoordinatorOptions, CoordinatorFailure, CoordinatorResult, CoordinatorStatus,
+  DiscoveryRecovery, DiscoveryRecoveryReason } from './accountCoordinatorTypes.js';
 
 const fail = (reason: CoordinatorFailure, retryAfterMs?: number): CoordinatorResult =>
   ({ ok: false, reason, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
@@ -386,7 +387,79 @@ class Coordinator implements AccountCoordinator {
       }
     }
   }
+  #recovery(result: DiscoveryRunResult): DiscoveryRecovery {
+    const coverage = result.ok ? result.snapshot.enumeration === 'finished' ? 'complete' : 'partial'
+      : result.partial ? 'partial' : 'unknown';
+    if (result.ok) {
+      return { disposition: 'none', reason: coverage === 'complete' ? 'complete' : 'incomplete', coverage };
+    }
+    const e = result.error;
+    const none = (reason: DiscoveryRecoveryReason): DiscoveryRecovery => ({ disposition: 'none', reason, coverage });
+    const attention = (reason: DiscoveryRecoveryReason): DiscoveryRecovery => ({ disposition: 'attention', reason, coverage });
+    if (e.kind === 'cancelled' || e.kind === 'invalidated' || e.kind === 'stopped') {
+      return none(e.kind);
+    }
+    if (e.kind === 'clock-invalid' || e.kind === 'dependency') {
+      return attention(e.kind);
+    }
+    try {
+      const token = this.#tokens.getStatus();
+      const retry = (reason: DiscoveryRecoveryReason): DiscoveryRecovery => {
+        const delays = [e.retryAfterMs, e.discoveryFailure?.retryAfterMs, e.tokenFailure?.retryAfterMs,
+          this.#remaining(), token.renewal === 'backoff' ? token.retryAfterMs : undefined];
+        const minimumRetryDelayMs = Math.max(0, ...delays.filter(number));
+        return { disposition: 'retry', reason, coverage, ...(minimumRetryDelayMs > 0 ? { minimumRetryDelayMs } : {}) };
+      };
+      if (token.renewal === 'attention-required') {
+        return attention(token.reason === 'clock-invalid' ? 'clock-invalid' : 'authentication');
+      }
+      if (token.renewal === 'stopped') {
+        return none('stopped');
+      }
+      if (e.kind === 'authentication') {
+        return e.tokenFailure?.kind === 'backoff' || e.tokenFailure?.kind === 'rate-limited'
+          ? retry(e.tokenFailure.kind === 'rate-limited' ? 'rate-limited' : 'authentication') : attention('authentication');
+      }
+      const http = e.discoveryFailure;
+      if (http?.status === 401 || http?.kind === 'unauthorized') {
+        return attention('authentication');
+      }
+      if (http?.status === 403 || http?.kind === 'forbidden') {
+        return attention('permission');
+      }
+      if (http?.status === 429 || http?.kind === 'rate-limited' || e.kind === 'cooldown') {
+        return retry('rate-limited');
+      }
+      if (e.kind === 'deadline' || e.kind === 'token-expired') {
+        return retry(e.kind);
+      }
+      if (http?.kind === 'transport' || http?.kind === 'timeout'
+        || (http?.kind === 'http' && [408, 500, 502, 503, 504].includes(http.status ?? 0))) {
+        return retry('transient');
+      }
+      return attention(http?.kind === 'invalid-response' ? 'invalid-response' : 'dependency');
+    } catch {
+      return attention('clock-invalid');
+    }
+  }
   discover(options: { readonly signal?: AbortSignal } = {}): Promise<CoordinatorResult> {
+    // Detach metadata for each waiter, including shared runs; do not inspect a replacement context here.
+    return this.#discover(options).then(result => {
+      if (result.recovery) {
+        return structuredClone(result);
+      }
+      const reason = result.ok ? undefined : result.reason;
+      const recovery: DiscoveryRecovery = reason === 'cooldown'
+        ? { disposition: 'retry', reason: 'rate-limited', coverage: 'unknown',
+          ...(number(result.ok ? undefined : result.retryAfterMs) ? { minimumRetryDelayMs: result.ok ? undefined : result.retryAfterMs } : {}) }
+        : reason === 'cancelled' || reason === 'invalidated' || reason === 'stopped'
+          ? { disposition: 'none', reason, coverage: 'unknown' }
+          : { disposition: 'attention', reason: reason === 'clock-invalid' || reason === 'dependency' || reason === 'authentication' ? reason : 'not-ready',
+            coverage: 'unknown' };
+      return { ...result, recovery };
+    });
+  }
+  #discover(options: { readonly signal?: AbortSignal } = {}): Promise<CoordinatorResult> {
     if (this.#stopped) {
       return Promise.resolve(fail('stopped'));
     }
@@ -442,7 +515,8 @@ class Coordinator implements AccountCoordinator {
         if (authentication && this.#tokens.getStatus().renewal === 'attention-required') {
           this.#status = { ...this.#status, phase: 'attention-required' };
         }
-        op.resolve(result.ok ? { ok: true } : fail(authentication ? 'authentication' : 'discovery', retry));
+        op.resolve({ ...(result.ok ? { ok: true as const } : fail(authentication ? 'authentication' : 'discovery', retry)),
+          recovery: this.#recovery(result) });
         this.#notify();
       }).catch(() => {
         if (this.#current(c) && c.operation === op) {

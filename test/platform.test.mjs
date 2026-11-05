@@ -8,7 +8,11 @@ import timers from 'node:timers';
 import { URL } from 'node:url';
 
 function forbidEffects(t) {
-  const forbidden = () => assert.fail('Platform foundation attempted a network connection or scheduled work');
+  let attempts = 0;
+  t.after(() => assert.equal(attempts, 0));
+  const forbidden = () => {
+    attempts++; assert.fail('Platform attempted a network connection or scheduled work');
+  };
   t.mock.method(globalThis, 'fetch', forbidden);
   t.mock.method(net.Socket.prototype, 'connect', forbidden);
   t.mock.method(dgram, 'createSocket', forbidden);
@@ -18,9 +22,13 @@ function forbidEffects(t) {
   t.mock.method(timers, 'setTimeout', forbidden);
 }
 
-function fakeApi() {
+function fakeApi(t) {
   const api = new EventEmitter();
-  const forbidden = () => assert.fail('Platform foundation attempted to create or modify an accessory');
+  let attempts = 0;
+  t.after(() => assert.equal(attempts, 0));
+  const forbidden = () => {
+    attempts++; assert.fail('Platform attempted accessory operations');
+  };
   api.platformAccessory = forbidden;
   api.registerPlatformAccessories = forbidden;
   api.updatePlatformAccessories = forbidden;
@@ -50,14 +58,18 @@ test('entry point registers the package and schema identities without starting w
 
   assert.equal(pkg.name, 'homebridge-toniebox');
   assert.equal(schema.pluginAlias, 'Toniebox');
+  assert.equal(schema.singular, true);
+  assert.equal(schema.schema.properties.password.format, 'password');
+  assert.equal(schema.schema.properties.username.type, 'string');
+  assert.deepEqual(schema.schema.required, ['name']);
   assert.deepEqual(calls, [[pkg.name, schema.pluginAlias, TonieboxPlatform]]);
 });
 
-test('startup and lifecycle events remain offline, inert and private', async (t) => {
+test('startup delegates once after launch and remains private with synthetic backend', async (t) => {
   forbidEffects(t);
   const { TonieboxPlatform } = await import('../dist/platform.js');
   const { log, entries } = fakeLogger();
-  const api = fakeApi();
+  const api = fakeApi(t);
   const config = Object.freeze({
     platform: 'Toniebox',
     name: 'SYNTHETIC_PRIVATE_DEVICE_NAME',
@@ -67,12 +79,30 @@ test('startup and lifecycle events remain offline, inert and private', async (t)
     refreshToken: 'SYNTHETIC_REFRESH_TOKEN',
   });
 
-  new TonieboxPlatform(log, config, api);
+  const calls = [];
+  new TonieboxPlatform(log, config, api, { coordinatorFactory: () => {
+    calls.push('create'); return {
+      setCredentials: () => {
+        calls.push('credentials'); return { ok: true };
+      },
+      start: () => {
+        calls.push('start'); return { ok: true };
+      },
+      discover: () => {
+        calls.push('discover'); return Promise.resolve({ ok: true });
+      },
+      stop: () => {
+        calls.push('stop');
+      },
+    };
+  } });
+  assert.deepEqual(calls, []);
   api.emit('didFinishLaunching');
   api.emit('shutdown');
 
-  assert.equal(api.eventNames().length, 0);
-  assert.ok(entries.length > 0, 'The inert development status should be visible');
+  api.emit('didFinishLaunching'); api.emit('shutdown');
+  assert.deepEqual(calls, ['create', 'credentials', 'start', 'discover', 'stop']);
+  assert.ok(entries.length > 0, 'Backend lifecycle status should be visible');
   const output = JSON.stringify(entries);
   for (const value of Object.values(config).filter(value => value.startsWith('SYNTHETIC_'))) {
     assert.equal(output.includes(value), false, 'Configuration data must not appear in logs');
@@ -83,7 +113,7 @@ test('restored accessories are neither changed, deleted nor logged', async (t) =
   forbidEffects(t);
   const { TonieboxPlatform } = await import('../dist/platform.js');
   const { log, entries } = fakeLogger();
-  const api = fakeApi();
+  const api = fakeApi(t);
   const accessory = Object.freeze({
     UUID: 'SYNTHETIC_PRIVATE_BOX_UUID',
     displayName: 'SYNTHETIC_PRIVATE_ACCESSORY_NAME',
@@ -96,9 +126,9 @@ test('restored accessories are neither changed, deleted nor logged', async (t) =
 
   platform.configureAccessory(accessory);
   platform.configureAccessory(accessory);
+  assert.equal(entries.length, logCount);
   api.emit('didFinishLaunching');
   api.emit('shutdown');
-
   assert.equal(JSON.stringify(accessory), before);
-  assert.equal(entries.length, logCount);
+  assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC/);
 });

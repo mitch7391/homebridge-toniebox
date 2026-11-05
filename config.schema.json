@@ -12,6 +12,16 @@
         "title": "Name",
         "type": "string",
         "default": "Toniebox"
+      },
+      "username": {
+        "title": "Tonies username",
+        "type": "string"
+      },
+      "password": {
+        "title": "Tonies password",
+        "type": "string",
+        "format": "password",
+        "description": "Masked in the UI; stored in Homebridge config.json without encryption."
       }
     }
   }
