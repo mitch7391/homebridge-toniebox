@@ -181,6 +181,28 @@ The project now passes **827 automated offline tests**, including **52 new tests
 
 This completes Increment 6B. Increment 6C will connect the standalone backend to Homebridge, including configuration, startup and shutdown handling.
 
+### ✅ Increment 6C - Homebridge Platform Integration (Complete)
+
+The final part of backend integration is now implemented.
+
+The existing Toniebox account coordinator is now connected to the Homebridge platform lifecycle. The plugin can accept configured Tonies account credentials, initialise the backend after Homebridge finishes launching, and automatically begin device discovery and authorised MQTT connectivity.
+
+Startup remains non-blocking, allowing Homebridge to operate normally while authentication and discovery take place. Missing or invalid credentials leave the backend safely inactive without attempting network communication.
+
+A dedicated platform runtime manages discovery recovery using the coordinator's sanitised recovery advice. Temporary failures are retried using bounded backoff, jitter and existing cloud rate-limit protections. Successful discovery ends the recovery sequence without introducing continuous REST polling.
+
+The integration also provides controlled shutdown, cancellation and protection against stale callbacks or asynchronous operations continuing after the backend has stopped.
+
+Privacy-safe operational logging reports discovery progress, connection status and conditions requiring attention. Production and experimental connectivity are reported independently to avoid misrepresenting healthy connections.
+
+Existing HomeKit accessory behaviour remains unchanged. The plugin does not yet create accessories, expose HomeKit controls or publish device commands.
+
+The project now passes **928 automated offline tests**, including **101 new tests across Increment 6C** covering discovery recovery, Homebridge startup, configuration validation, lifecycle management, cancellation, diagnostics and shutdown. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
+
+This completes Increment 6, establishing the Homebridge backend integration required for future HomeKit accessories and device controls.
+
+Live Tonies Cloud and Homebridge hardware testing remain necessary before the plugin is suitable for beta use.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -196,10 +218,10 @@ Here's the current plan for development:
 - [x] **Increment 5:** MQTT connectivity and reconnection
   - [x] **5A:** Guarded MQTT transport and subscriptions
   - [x] **5B:** Token-managed connection lifecycle and reconnection
-- [ ] **Increment 6:** Backend coordination and integration
+- [x] **Increment 6:** Backend coordination and integration
   - [x] **6A:** Device routing and state integration
   - [x] **6B:** Account coordination and lifecycle management
-  - [ ] **6C:** Homebridge platform integration
+  - [x] **6C:** Homebridge platform integration
 - [ ] **Future:** HomeKit accessories and controls
 - [ ] **Future:** Beta testing and refinement
 
