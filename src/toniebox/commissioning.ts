@@ -1,3 +1,4 @@
+import type { CredentialSnapshot } from './tokenManagerTypes.js';
 import type { DiscoveryRunResult } from './discoveryRunnerTypes.js';
 import type { RouteApproval, CompatibilityPolicy } from './routingTypes.js';
 import { assessCompatibility } from './routingPolicy.js';
@@ -22,7 +23,10 @@ export type CommissioningObservation =
     households: number; devices: number; tb2Candidates: number; productionRoutes: number;
     exclusions: Record<typeof exclusions[number], number> }
   | { kind: 'lifecycle'; lane: Lane; previouslyReady: boolean; phase: 'waiting-retry' | 'attention-required';
-    failure?: MqttLifecycleFailure['kind']; tokenFailure?: MqttLifecycleFailure['tokenFailure'] }
+    failure?: MqttLifecycleFailure['kind']; tokenFailure?: MqttLifecycleFailure['tokenFailure'];
+    origin?: 'disconnect' | 'error'; reasonCode?: 134 | 135 }
+  | { kind: 'renewal'; grant: 'login' | 'refresh'; outcome: 'success' | 'failure'; accessChanged?: boolean }
+  | { kind: 'replacement'; lane: Lane; cause: 'proactive' | 'recovery'; phase: 'connecting' | 'ready' }
   | { kind: 'session'; lane: Lane; established: number }
   | { kind: 'messages'; lane: Lane; received: number; accepted: number; rejected: number;
     unchanged: number; changed: number; retained: number; live: number;
@@ -72,7 +76,18 @@ export class CommissioningObserver {
     }
     this.#emit({ kind: 'lifecycle', lane, previouslyReady, phase: status.phase,
       ...(status.error ? { failure: status.error.kind } : {}),
-      ...(status.error?.kind === 'token' && status.error.tokenFailure ? { tokenFailure: status.error.tokenFailure } : {}) }, current);
+      ...(status.error?.kind === 'token' && status.error.tokenFailure ? { tokenFailure: status.error.tokenFailure } : {}),
+      ...(status.error?.origin ? { origin: status.error.origin } : {}),
+      ...(status.error?.reasonCode ? { reasonCode: status.error.reasonCode } : {}) }, current);
+  }
+  renewal(grant: NonNullable<CredentialSnapshot['grant']>, current: () => boolean): void {
+    this.#emit({ kind: 'renewal', grant: grant.kind, outcome: grant.outcome,
+      ...(typeof grant.accessChanged === 'boolean' ? { accessChanged: grant.accessChanged } : {}) }, current);
+  }
+  replacement(lane: Lane, status: MqttLifecycleStatus, current: () => boolean): void {
+    if (status.replacement && (status.phase === 'connecting' || status.phase === 'ready')) {
+      this.#emit({ kind: 'replacement', lane, cause: status.replacement, phase: status.phase }, current);
+    }
   }
   session(lane: Lane, current: () => boolean): void {
     this.#sessions[lane] = count(this.#sessions[lane] + 1);

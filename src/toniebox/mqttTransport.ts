@@ -289,7 +289,7 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
       finish({ kind: 'dependency' });
     }
   }
-  function onError(error: unknown): void {
+  function failure(error: unknown, origin: 'disconnect' | 'error'): void {
     if (!active()) {
       return;
     }
@@ -300,14 +300,18 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
     const reason = typeof code === 'number' && Number.isInteger(code) && code >= 0 && code <= 255 ? code : undefined;
     const kind = code === 'unsafe-tracing' ? 'unsafe-tracing' : code === 'resource-limit' ? 'resource-limit'
       : code === 'protocol' ? 'protocol' : reason === 134 || reason === 135 ? 'authentication-refused' : 'transport';
-    finish({ kind, ...(reason === undefined ? {} : { reasonCode: reason }) });
+    finish({ kind, ...(reason === undefined ? {} : { reasonCode: reason }),
+      ...(kind === 'authentication-refused' ? { origin } : {}) });
   }
   function onClose(): void {
     finish({ kind: 'transport' });
   }
+  function onError(error: unknown): void {
+    failure(error, 'error');
+  }
   function onDisconnect(packet: { reasonCode?: number }): void {
     try {
-      onError({ code: packet?.reasonCode });
+      failure({ code: packet?.reasonCode }, 'disconnect');
     } catch {
       finish({ kind: 'dependency' });
     }

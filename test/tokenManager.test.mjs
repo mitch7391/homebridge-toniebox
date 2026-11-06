@@ -10,19 +10,29 @@ const credentials = Object.freeze({ username: ' SYNTHETIC_ACCOUNT ', password: '
 const changed = Object.freeze({ username: 'SYNTHETIC_OTHER', password: 'SYNTHETIC_OTHER_PASSWORD' });
 const secret = 'SYNTHETIC_EXCEPTION_SECRET';
 let createTokenManager;
+let nextAccessRevision;
+let forbiddenAttempts = 0;
 let createAuthClient;
 const fixtures = [];
 
 before(async () => {
-  const forbidden = () => assert.fail('Unexpected network or real timer');
+  const forbidden = () => {
+    forbiddenAttempts++; assert.fail('Unexpected network or real timer');
+  };
   mock.method(globalThis, 'fetch', forbidden);
   mock.method(net.Socket.prototype, 'connect', forbidden);
   mock.method(globalThis, 'setTimeout', forbidden);
   mock.method(globalThis, 'setInterval', forbidden);
-  ({ createTokenManager } = await import('../dist/toniebox/tokenManager.js'));
+  ({ createTokenManager, nextAccessRevision } = await import('../dist/toniebox/tokenManager.js'));
   ({ createAuthClient } = await import('../dist/toniebox/authClient.js'));
 });
-after(() => mock.restoreAll());
+after(() => {
+  try {
+    assert.equal(forbiddenAttempts, 0);
+  } finally {
+    mock.restoreAll();
+  }
+});
 afterEach(() => {
   for (const f of fixtures.splice(0)) {
     f.manager.stop();
@@ -196,7 +206,7 @@ test('refresh atomically replaces opaque tokens and never returns the refresh to
   await renew(f);
   assert.equal(f.calls[1].input, 'SYNTHETIC_REFRESH_A');
   assert.deepEqual(await f.manager.getAccessToken(), {
-    ok: true, accessToken: 'SYNTHETIC_ACCESS_B', tokenType: 'Bearer', remainingLifetimeMs: 300000,
+    ok: true, accessToken: 'SYNTHETIC_ACCESS_B', tokenType: 'Bearer', remainingLifetimeMs: 300000, revision: 2,
   });
   await renew(f, success('C'));
   assert.equal(f.calls[2].input, 'SYNTHETIC_REFRESH_B');
@@ -1084,4 +1094,138 @@ test('an exact normal expiry never returns old access while a refresh is pending
   assertFailure(await waiting, 'backoff');
   assert.equal(f.calls.length, 2);
   f.manager.stop();
+});
+
+
+test('credential observer is deferred, initially inert and detached', async () => {
+  const f = fixture(); f.manager.setCredentials(credentials); const events = [];
+  const controller = new AbortController();
+  const remove = f.manager.observeCredentials(s => events.push(s), { signal: controller.signal });
+  assert.equal(events.length, 0); await flush();
+  assert.equal(events.length, 1); assert.equal(events[0].revision, undefined); assert.equal(f.calls.length, 0);
+  events[0].status.renewal = 'stopped'; assert.equal(f.manager.getStatus().renewal, 'ready');
+  remove(); remove(); assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('access revisions track values across four rotations, not refresh-token rotation or grants', async () => {
+  const f = fixture(); const initial = await login(f); assert.equal(initial.revision, 1);
+  const events = []; f.manager.observeCredentials(s => events.push(s)); await flush();
+  for (const [name, expected] of [['A', 1], ['B', 2], ['C', 3], ['D', 4]]) {
+    await renew(f, success(name, { refreshToken: 'SYNTHETIC_REFRESH_' + expected }));
+    assert.equal((await f.manager.getAccessToken()).revision, expected);
+    assert.equal(events.at(-1).grant.accessChanged, name !== 'A');
+  }
+  assert.equal(f.calls.filter(c => c.kind === 'login').length, 1);
+  assert.doesNotMatch(JSON.stringify(events), /SYNTHETIC|accessToken|refreshToken/);
+});
+
+test('failed renewal reports failure without advancing revision or issuing observer grants', async () => {
+  const f = fixture(); await login(f); const events = [];
+  f.manager.observeCredentials(s => events.push(s));
+  await renew(f, fail('transport'));
+  assert.equal(events.at(-1).revision, 1); assert.equal(events.at(-1).grant.outcome, 'failure');
+  assert.equal(events.at(-1).status.renewal, 'backoff'); assert.equal(f.calls.length, 2);
+  assert.equal((await f.manager.getAccessToken()).revision, 1);
+});
+
+for (const mode of ['clear', 'stop', 'replace', 'unsubscribe', 'abort']) {
+  test('credential queued delivery is suppressed on ' + mode, async () => {
+    const f = fixture(); await login(f); const events = []; const controller = new AbortController();
+    const remove = f.manager.observeCredentials(s => events.push(s), { signal: controller.signal });
+    if (mode === 'replace') {
+      f.manager.setCredentials(changed);
+    } else if (mode === 'unsubscribe') {
+      remove();
+    } else if (mode === 'abort') {
+      controller.abort();
+    } else {
+      f.manager[mode]();
+    }
+    await flush(); assert.deepEqual(events, []);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  });
+}
+
+test('credential context replacement preserves revision monotonicity even with equal access text', async () => {
+  const f = fixture(); await login(f); f.manager.clear(); f.manager.setCredentials(changed);
+  f.queue.push(success()); await f.advance(30000);
+  assert.equal((await f.manager.getAccessToken()).revision, 2);
+});
+
+test('same-value delayed refresh after local expiry does not increment access revision', async () => {
+  const f = fixture(); await login(f); const pending = deferred(); f.queue.push(pending.promise);
+  await f.advance(240000); await f.advance(60000);
+  pending.resolve(success()); await flush();
+  assert.equal((await f.manager.getAccessToken()).revision, 1);
+});
+
+test('credential observers coalesce and contain throws, rejections and reentrant invalidation', async () => {
+  const f = fixture(); await login(f); const events = [];
+  f.manager.observeCredentials(() => {
+    throw new Error(secret);
+  });
+  f.manager.observeCredentials(() => Promise.reject(new Error(secret)));
+  f.manager.observeCredentials(s => events.push(s));
+  f.queue.push(success('B')); f.jump(240000);
+  const a = f.manager.getAccessToken(); const b = f.manager.getAccessToken(); await Promise.all([a,b]); await flush();
+  assert.equal(f.calls.length, 2); assert.equal(events.filter(e => e.revision === 2).length, 1);
+  let other = 0;
+  f.manager.observeCredentials(() => f.manager.clear());
+  f.manager.observeCredentials(() => other++); await flush(); assert.equal(other, 0);
+});
+
+test('revision exhaustion boundary fails closed without wrapping', () => {
+  assert.equal(nextAccessRevision(0), 1);
+  assert.equal(nextAccessRevision(Number.MAX_SAFE_INTEGER - 1), Number.MAX_SAFE_INTEGER);
+  for (const n of [Number.MAX_SAFE_INTEGER, -1, NaN, Infinity, 0.5]) {
+    assert.throws(() => nextAccessRevision(n));
+  }
+});
+
+test('terminal renewal attention is observable even while old access remains usable', async () => {
+  const f = fixture(); await login(f); const events = []; f.manager.observeCredentials(e => events.push(e));
+  await renew(f, fail('http', { status: 401, oauthError: 'invalid_client' }));
+  assert.equal((await f.manager.getAccessToken()).ok, true);
+  assert.equal(events.at(-1).status.renewal, 'attention-required'); assert.equal(events.at(-1).grant.outcome, 'failure');
+});
+
+
+for (const mode of ['clear', 'stop', 'replace']) {
+  test('pending refresh cannot notify old context after ' + mode, async () => {
+    const f = fixture(); await login(f); const events = [];
+    f.manager.observeCredentials(e => events.push(e)); await flush();
+    const pending = deferred(); f.queue.push(pending.promise); await f.advance(240000);
+    const before = events.length;
+    if (mode === 'replace') {
+      f.manager.setCredentials(changed);
+    } else {
+      f.manager[mode]();
+    }
+    pending.resolve(success('LATE')); await flush(); assert.equal(events.length, before);
+  });
+}
+
+
+test('terminal comparison cleanup preserves usable access, revisions and explicit-reset authority', async () => {
+  const f = fixture(); const issued = await login(f); const original = { ...issued };
+  await renew(f, fail('http', { status: 401, oauthError: 'invalid_client' }));
+  for (let i = 0; i < 3; i++) {
+    const current = await f.manager.getAccessToken();
+    assert.equal(current.ok, true);
+    assert.equal(current.accessToken, issued.accessToken);
+    assert.equal(current.revision, issued.revision);
+    assert.equal(current.remainingLifetimeMs, 60000);
+  }
+  assert.deepEqual(issued, original);
+  assert.equal(f.manager.getStatus().renewal, 'attention-required');
+  assert.equal(f.manager.setCredentials(changed).error.kind, 'reauthorization-required');
+  assert.equal(f.calls.length, 2);
+  await f.advance(60000);
+  assert.equal((await f.manager.getAccessToken()).ok, false);
+  assert.equal(f.calls.length, 2);
+  f.manager.clear();
+  const replacement = await login(f, success());
+  assert.equal(replacement.accessToken, issued.accessToken);
+  assert.equal(replacement.revision, issued.revision + 1);
+  assert.deepEqual(issued, original);
 });
