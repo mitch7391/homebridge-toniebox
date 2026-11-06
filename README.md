@@ -17,7 +17,7 @@
 > [!IMPORTANT]
 > **This plugin is currently under development and is not ready for installation.**
 >
-> The foundations are in place, but live Toniebox connectivity and Apple Home integration are still being developed. You're welcome to follow along as the project progresses!
+> The Homebridge backend has been implemented and successfully tested against Tonies Cloud in a controlled Raspberry Pi commissioning environment. HomeKit accessories, device controls and broader reliability testing are still under development. You're welcome to follow along as the project progresses!
 
 **Homebridge Toniebox** is an independent project aiming to bring the Toniebox into the smart home through Homebridge.
 
@@ -133,7 +133,9 @@ The project now passes **432 automated offline tests**, including **101 new test
 
 The second part of MQTT connectivity is now implemented.
 
-A standalone MQTT lifecycle component coordinates the existing token manager and guarded MQTT transport. It acquires usable access tokens for each connection attempt and automatically reconnects after temporary failures using bounded backoff and jitter. Healthy connections are not interrupted merely because their authentication tokens are renewed.
+A standalone MQTT lifecycle component coordinates the existing token manager and guarded MQTT transport. It acquires usable access tokens for each connection attempt and automatically reconnects after temporary failures using bounded backoff and jitter. The original implementation deliberately avoided restarting healthy MQTT connections solely because an access token was renewed.
+
+Subsequent live commissioning demonstrated that Tonies Cloud could reject an established MQTT connection when its original access credential expired. Increment 7A.2 therefore introduced controlled connection replacement when new access credentials are adopted, superseding that earlier behaviour.
 
 The lifecycle also manages MQTT session generations, protects against stale callbacks and messages, and handles cancellation, shutdown and connection failures conservatively. Definitive MQTT authentication refusal requires attention rather than repeatedly retrying rejected credentials.
 
@@ -201,7 +203,77 @@ The project now passes **928 automated offline tests**, including **101 new test
 
 This completes Increment 6, establishing the Homebridge backend integration required for future HomeKit accessories and device controls.
 
-Live Tonies Cloud and Homebridge hardware testing remain necessary before the plugin is suitable for beta use.
+Live Tonies Cloud connectivity was subsequently validated through Increment 7A. Further reliability testing and HomeKit accessory development remain necessary before the plugin is suitable for beta use.
+
+### ✅ Increment 7A.1 - Opt-in Commissioning Diagnostics (Complete)
+
+The first part of live backend commissioning introduced a passive, opt-in diagnostic observer for validating the existing integration against real Tonies Cloud connections.
+
+The observer provides privacy-safe summaries of account discovery, household and device coverage, routing eligibility, MQTT session establishments and device-state processing. It distinguishes production and experimental connections, accepted and rejected messages, retained and live updates, and coverage across the seven supported MQTT state categories.
+
+Diagnostic observations are bounded and protected against stale account contexts, expired sessions and observer failures. They do not introduce additional cloud requests, MQTT subscriptions or device commands.
+
+Commissioning diagnostics are disabled in the committed source through `COMMISSIONING_BUILD = false` and can only be enabled in a separately prepared commissioning build.
+
+Increment 7A.1 passed automated offline validation and enabled the first controlled Raspberry Pi commissioning runs.
+
+Those initial live tests successfully established Tonies Cloud connectivity but revealed a reproducible MQTT authentication failure approximately five minutes after connection establishment. Further investigation showed that access credentials were being renewed while the existing MQTT connection continued using its original authentication credentials.
+
+This finding led directly to Increment 7A.2.
+
+### ✅ Increment 7A.2 - MQTT Credential Renewal and Recovery (Complete)
+
+The second part of live backend commissioning addresses the MQTT authentication lifecycle issue identified during Increment 7A.1.
+
+The token manager now tracks revisions of adopted access credentials and provides controlled notifications when credentials change. The MQTT lifecycle uses these revisions to replace established connections proactively, allowing a new connection to authenticate using the updated credential before the previous credential expires.
+
+Connection replacement preserves existing account ownership and authorised device routing while protecting against stale callbacks, obsolete session authority, overlapping connection attempts and reuse of rejected credentials.
+
+The implementation also introduces revision-gated recovery for qualifying broker authentication failures, including post-ready MQTT DISCONNECT reason code 135. Recovery is constrained by existing authentication, retry, cooldown and terminal-attention safeguards rather than repeatedly reconnecting with credentials already known to have been refused.
+
+Additional privacy-safe commissioning observations distinguish credential renewal, proactive connection replacement and recovery activity without exposing authentication tokens or private device identifiers.
+
+#### Live Raspberry Pi commissioning
+
+On 6 November 2026, Increment 7A.2 was tested against the real Tonies Cloud service using an isolated Homebridge instance on a Raspberry Pi running Node.js 24.22.2.
+
+The approximately 30-minute commissioning run recorded:
+
+- **8 successfully established production MQTT sessions.**
+- **7 consecutive successful credential-driven connection replacements.**
+- **8 access-credential adoption/change observations**, including the initial credential adoption.
+- **0 observed lifecycle retry events.**
+- **0 terminal authentication attention events.**
+- **0 error or warning keyword matches** in the final log screening.
+
+Every observed proactive replacement progressed through connection establishment to MQTT readiness.
+
+The commissioning process exited, its dedicated Homebridge port was released, and the existing production Homebridge service remained active.
+
+The original approximately five-minute authentication failure did not recur during this test.
+
+This satisfies the primary live credential-rotation commissioning objective. It does not establish indefinite reliability or complete coverage of all failure scenarios.
+
+In particular, reactive recovery from broker DISCONNECT reason code 135 has automated offline test coverage but has not been exercised against the live broker. Multi-day unattended stability also remains to be validated.
+
+#### Validation
+
+Increment 7A.2 passed **1,028 automated offline tests** on Windows and Raspberry Pi Linux.
+
+TypeScript type-checking, ESLint and the production build also passed.
+
+GitHub Actions validation completed successfully on:
+
+- Node.js 22.x
+- Node.js 24.x
+- Minimum supported Node.js 22.10.0
+- Minimum supported Node.js 24.0.0
+
+The automated tests use controlled offline fixtures and mocked dependencies. The separate Raspberry Pi commissioning run provides real-world connectivity evidence.
+
+Commissioning diagnostics remain disabled in committed source, and the plugin still does not create HomeKit accessories or publish device commands.
+
+This completes Increment 7A, establishing a live-validated backend foundation for future HomeKit accessory development.
 
 ## Roadmap
 
@@ -222,6 +294,9 @@ Here's the current plan for development:
   - [x] **6A:** Device routing and state integration
   - [x] **6B:** Account coordination and lifecycle management
   - [x] **6C:** Homebridge platform integration
+- [x] **Increment 7A:** Live backend commissioning and MQTT reliability
+  - [x] **7A.1:** Opt-in commissioning diagnostics
+  - [x] **7A.2:** MQTT credential renewal and recovery
 - [ ] **Future:** HomeKit accessories and controls
 - [ ] **Future:** Beta testing and refinement
 
@@ -260,7 +335,7 @@ The project currently declares support for the following environments:
 
 Node.js 24 is recommended for development. Node.js 22.13.0 or newer is needed for the current ESLint development tooling.
 
-Compatibility with running Homebridge installations still needs to be validated.
+The backend has been validated in an isolated Raspberry Pi Homebridge environment. General installation compatibility, HomeKit accessory behaviour and longer-term unattended operation remain to be validated.
 
 ### Building from source
 
@@ -280,7 +355,9 @@ npm test
 
 Automated GitHub Actions workflows validate the project across Node.js 22 and 24, including minimum supported runtime checks.
 
-All tests currently run offline using synthetic data and mocked Homebridge interfaces. No Toniebox hardware, Tonies account or MQTT connection is required.
+Automated tests run offline using synthetic data, controlled fixtures and mocked Homebridge interfaces. No Toniebox hardware, Tonies account or live MQTT connection is required to execute the test suite.
+
+Separate manual commissioning has also validated the backend against a real Toniebox 2 and Tonies Cloud, as documented in Increment 7A. These results should not be confused with the automated GitHub Actions tests.
 
 ### Technical Documentation
 
