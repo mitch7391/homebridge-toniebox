@@ -38,8 +38,14 @@ export type AccessTokenResult =
       readonly accessToken: string;
       readonly tokenType: 'Bearer';
       readonly remainingLifetimeMs: number;
+      /** Present on real-manager successes. Optional here for defensive discovery projections. */
+      readonly revision?: number;
     }
   | { readonly ok: false; readonly error: TokenManagerFailure };
+
+/** Mandatory revision on the real manager/provider contract; discovery keeps its existing projection type. */
+export type RevisionAccessTokenResult = Extract<AccessTokenResult, { ok: false }>
+  | (Extract<AccessTokenResult, { ok: true }> & { readonly revision: number });
 
 export interface TokenManagerStatus {
   readonly access: 'unavailable' | 'usable' | 'expiring' | 'expired';
@@ -51,12 +57,26 @@ export interface TokenManagerStatus {
   readonly authFailure?: AuthFailure;
 }
 
+/** Non-secret observation. A subscription belongs to the current credential context. */
+export interface CredentialSnapshot {
+  readonly revision?: number;
+  readonly status: TokenManagerStatus;
+  readonly grant?: {
+    readonly kind: 'login' | 'refresh';
+    readonly outcome: 'success' | 'failure';
+    readonly accessChanged?: boolean;
+  };
+}
+
 export interface TokenManager {
   /** Inert; identical active credentials are a no-op. Terminal attention requires clear first. */
   setCredentials(credentials: AuthCredentials): CredentialUpdateResult;
-  getAccessToken(options?: { readonly signal?: AbortSignal }): Promise<AccessTokenResult>;
+  getAccessToken(options?: { readonly signal?: AbortSignal }): Promise<RevisionAccessTokenResult>;
   /** No requests. Returned metadata contains no credentials or token values. */
   getStatus(): TokenManagerStatus;
+  /** Deferred, coalesced, observational only. Reset/stop and abort unsubscribe permanently. */
+  observeCredentials(observer: (snapshot: CredentialSnapshot) => void,
+    options?: { readonly signal?: AbortSignal }): () => void;
   /** Explicit operator reset. Removes secrets but preserves any dispatch cooldown. */
   clear(): void;
   /** Terminal, idempotent shutdown. */

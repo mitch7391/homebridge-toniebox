@@ -2,7 +2,7 @@ import { performance } from 'node:perf_hooks';
 
 import type { AuthClient, AuthCredentials, AuthFailure, AuthResult, AuthTokens, OAuthErrorCode } from './authTypes.js';
 import type {
-  AccessTokenResult, CredentialUpdateResult, TokenClock, TokenManager, TokenManagerFailure,
+  RevisionAccessTokenResult, CredentialSnapshot, CredentialUpdateResult, TokenClock, TokenManager, TokenManagerFailure,
   TokenManagerFailureKind, TokenManagerOptions, TokenManagerStatus, TokenScheduler,
 } from './tokenManagerTypes.js';
 
@@ -18,6 +18,7 @@ const FAILURE_KINDS: readonly AuthFailure['kind'][] = [
 type Time = ReturnType<TokenClock['now']>;
 type OperationKind = 'login' | 'refresh';
 interface Pair {
+  revision: number;
   access?: string;
   refresh?: string;
   accessMs: number;
@@ -103,10 +104,30 @@ function recoverable(kind: OperationKind, error: AuthFailure): boolean {
     || (kind === 'refresh' && error.kind === 'invalid-response');
 }
 
+/** Pure exhaustion boundary; never wrap or recycle credential revisions. */
+export function nextAccessRevision(current: number): number {
+  if (!Number.isSafeInteger(current) || current < 0 || current >= Number.MAX_SAFE_INTEGER) {
+    throw new RangeError('Credential revision exhausted');
+  }
+  return current + 1;
+}
+interface Subscriber {
+  active: boolean;
+  queued: boolean;
+  generation: number;
+  observer: (snapshot: CredentialSnapshot) => void;
+  remove: () => void;
+}
+
 class AccountTokenManager implements TokenManager {
   readonly #client: AuthClient;
   readonly #clock: TokenClock;
   readonly #scheduler: TokenScheduler;
+  #revision = 0;
+  // Retained across local expiry solely to detect same-value adoption; cleared with the context.
+  #comparison?: string;
+  #grant?: CredentialSnapshot['grant'];
+  readonly #subscribers = new Set<Subscriber>();
   #credentials?: AuthCredentials;
   #pair?: Pair;
   #flight?: Flight;
@@ -125,6 +146,57 @@ class AccountTokenManager implements TokenManager {
     this.#client = options.authClient;
     this.#clock = options.clock ?? defaultClock;
     this.#scheduler = options.scheduler ?? defaultScheduler;
+  }
+
+  #publish(): void {
+    for (const subscriber of this.#subscribers) {
+      this.#queue(subscriber);
+    }
+  }
+
+  #queue(subscriber: Subscriber): void {
+    if (subscriber.queued || !subscriber.active || this.#stopped) {
+      return;
+    }
+    subscriber.queued = true;
+    void Promise.resolve().then(() => {
+      subscriber.queued = false;
+      if (!subscriber.active || this.#stopped || subscriber.generation !== this.#generation) {
+        return;
+      }
+      const status = this.getStatus();
+      if (!subscriber.active || this.#stopped || subscriber.generation !== this.#generation) {
+        return;
+      }
+      return subscriber.observer({ status, ...(this.#pair ? { revision: this.#pair.revision } : {}),
+        ...(this.#grant ? { grant: { ...this.#grant } } : {}) });
+    }).catch(() => undefined);
+  }
+
+  observeCredentials(observer: (snapshot: CredentialSnapshot) => void,
+    options: { readonly signal?: AbortSignal } = {}): () => void {
+    if (typeof observer !== 'function' || !isObject(options)
+      || (options.signal !== undefined && !(options.signal instanceof AbortSignal))) {
+      throw new TypeError('Invalid credential observer');
+    }
+    const signal = options.signal;
+    if (this.#stopped || signal?.aborted) {
+      return () => undefined;
+    }
+    const subscriber: Subscriber = { active: true, queued: false, generation: this.#generation, observer,
+      remove: () => {
+        subscriber.active = false;
+        this.#subscribers.delete(subscriber);
+        signal?.removeEventListener('abort', subscriber.remove);
+      } };
+    this.#subscribers.add(subscriber);
+    signal?.addEventListener('abort', subscriber.remove, { once: true });
+    if (signal?.aborted) {
+      subscriber.remove();
+    } else {
+      this.#queue(subscriber);
+    }
+    return subscriber.remove;
   }
 
   #cancelTimer(): void {
@@ -147,13 +219,18 @@ class AccountTokenManager implements TokenManager {
   }
 
   #pause(reason: TokenManagerFailureKind, error?: AuthFailure): void {
+    const changed = this.#attention !== reason;
     this.#attention = reason;
     this.#lastFailure = error;
     this.#credentials = undefined;
+    this.#comparison = undefined;
     if (this.#pair) {
       this.#pair.refresh = undefined;
     }
     this.#cancelTimer();
+    if (changed) {
+      this.#publish();
+    }
   }
 
   #time(): Time | undefined {
@@ -191,7 +268,7 @@ class AccountTokenManager implements TokenManager {
     } };
   }
 
-  #result(generation: number): AccessTokenResult {
+  #result(generation: number): RevisionAccessTokenResult {
     if (this.#stopped) {
       return this.#error('stopped');
     }
@@ -205,7 +282,7 @@ class AccountTokenManager implements TokenManager {
     this.#observe(now);
     const pair = this.#pair;
     if (pair?.access !== undefined) {
-      return { ok: true, accessToken: pair.access, tokenType: 'Bearer', remainingLifetimeMs: pair.accessMs - pair.age };
+      return { ok: true, accessToken: pair.access, tokenType: 'Bearer', remainingLifetimeMs: pair.accessMs - pair.age, revision: pair.revision };
     }
     if (this.#attention) {
       return this.#error(this.#attention, now);
@@ -261,6 +338,7 @@ class AccountTokenManager implements TokenManager {
     const delay = RECOVERY_MS[this.#recoveryStep];
     this.#recoveryStep = Math.min(this.#recoveryStep + 1, RECOVERY_MS.length - 1);
     this.#notBefore = Math.max(this.#notBefore, now.monotonicMs + delay);
+    this.#publish();
   }
 
   #complete(flight: Flight, result: AuthResult): void {
@@ -275,9 +353,24 @@ class AccountTokenManager implements TokenManager {
     this.#observe(now);
     if (result.ok) {
       const tokens = result.tokens;
+      const changed = this.#comparison !== tokens.accessToken;
+      try {
+        if (changed) {
+          this.#revision = nextAccessRevision(this.#revision);
+        }
+      } catch {
+        this.#pair = undefined;
+        this.#comparison = undefined;
+        this.#grant = { kind: flight.kind, outcome: 'failure' };
+        this.#pause('reauthorization-required');
+        flight.settle();
+        return;
+      }
+      this.#comparison = tokens.accessToken;
+      this.#grant = { kind: flight.kind, outcome: 'success', accessChanged: changed };
       // One replacement, including both rotated tokens and their request-start timing.
       this.#pair = {
-        access: tokens.accessToken, refresh: tokens.refreshToken,
+        revision: this.#revision, access: tokens.accessToken, refresh: tokens.refreshToken,
         accessMs: tokens.expiresInSeconds * 1000,
         refreshMs: tokens.refreshExpiresInSeconds === undefined ? undefined : tokens.refreshExpiresInSeconds * 1000,
         start: flight.start, age: 0,
@@ -301,7 +394,11 @@ class AccountTokenManager implements TokenManager {
     } else {
       this.#pause('authentication-failed', result.error);
     }
+    if (!result.ok) {
+      this.#grant = { kind: flight.kind, outcome: 'failure' };
+    }
     this.#arm(now);
+    this.#publish();
     flight.settle();
   }
 
@@ -338,6 +435,8 @@ class AccountTokenManager implements TokenManager {
       generation: this.#generation, kind, start: now, controller: new AbortController(), done, settle,
     };
     this.#flight = flight;
+    this.#grant = undefined;
+    this.#publish();
     this.#notBefore = Math.max(this.#notBefore, now.monotonicMs + MIN_GRANT_MS);
     this.#arm(now);
     // The flight and spacing gate are installed before invoking the injected client.
@@ -375,6 +474,11 @@ class AccountTokenManager implements TokenManager {
 
   #reset(): void {
     this.#generation++;
+    for (const subscriber of this.#subscribers) {
+      subscriber.remove();
+    }
+    this.#comparison = undefined;
+    this.#grant = undefined;
     this.#cancelTimer();
     this.#cancelFlight();
     this.#credentials = undefined;
@@ -411,7 +515,7 @@ class AccountTokenManager implements TokenManager {
     return { ok: true };
   }
 
-  getAccessToken(options: { readonly signal?: AbortSignal } = {}): Promise<AccessTokenResult> {
+  getAccessToken(options: { readonly signal?: AbortSignal } = {}): Promise<RevisionAccessTokenResult> {
     if (!isObject(options) || (options.signal !== undefined && !(options.signal instanceof AbortSignal))) {
       return Promise.resolve(this.#error('invalid-input'));
     }
@@ -428,7 +532,7 @@ class AccountTokenManager implements TokenManager {
     if (!flight || this.#generation !== generation) {
       return Promise.resolve(this.#result(generation));
     }
-    return new Promise<AccessTokenResult>((resolve) => {
+    return new Promise<RevisionAccessTokenResult>((resolve) => {
       let finished = false;
       const onAbort = (): void => {
         if (!finished) {

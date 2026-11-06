@@ -797,3 +797,64 @@ test('commissioning lifecycle budget, supersession and observer exceptions are c
   f.c.stop();const stopped=attempts;l.options.onStatus({ phase:'attention-required',connected:false });await drain();
   assert.equal(attempts,stopped);assert.equal(f.jobs.size,0);
 });
+
+
+test('shared real token manager renews production and experimental slots without discovery or rebinding', async () => {
+  const events = [], transports = [], slots = []; let serial = 0, logins = 0, refreshes = 0;
+  const grant = () => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_' + (++serial), refreshToken: 'SYNTHETIC_REFRESH_' + serial,
+    tokenType: 'Bearer', expiresInSeconds: 300 } });
+  let f;
+  f = fixture({ options: { policy: experimentalPolicy, onCommissioning: e => events.push(e), authClient: {
+    login: async () => {
+      logins++; return grant();
+    }, refresh: async () => {
+      refreshes++; return grant();
+    },
+  }, lifecycleFactory: options => {
+    slots.push(options);
+    return createMqttLifecycle({ ...options, jitter: () => 0.5, transportFactory: callbacks => {
+      const t = { callbacks, closed: false, getStatus: () => ({ phase: 'idle' }), close() {
+        this.closed = true;
+      },
+      async connect(auth, routes) {
+        this.auth = auth; this.routes = routes;
+        assert.ok(transports.filter(p => p !== this && p.routes?.[0].routeId === routes[0].routeId).every(p => p.closed));
+        callbacks.onStatus({ phase: 'ready' });
+        callbacks.onMessage({ routeId: routes[0].routeId, topic: 'external/toniebox/' + routes[0].macAddress + '/volume/state',
+          payload: new TextEncoder().encode('{"level":7}'), retained: true, duplicate: false, qos: 1, receivedAtMs: serial * 1000 });
+        return { ok: true };
+      } };
+      transports.push(t); return t;
+    } });
+  } } });
+  f.boxes = [box(), ...experiments(1)]; await f.begin(); await drain();
+  for (let n = 2; n <= 4; n++) {
+    const old = transports.slice(); const renewal = [...f.jobs].find(j => j.ms === 240000); assert.ok(renewal);
+    f.advance(240000); f.jobs.delete(renewal); renewal.fn(); await drain();
+    assert.equal(slots.length, 2); assert.equal(transports.length, n * 2);
+    const device = f.c.getDevice('SYNTHETIC_A');
+    assert.equal(device.state.topics['volume/state'].session, n); assert.equal(device.freshness['volume/state'], 'retained');
+    old[0].callbacks.onMessage({ routeId: 'SYNTHETIC_A', topic: 'external/toniebox/SYNTHETIC_A_MAC/volume/state',
+      payload: new TextEncoder().encode('{"level":99}'), retained: false, duplicate: false, qos: 1, receivedAtMs: 999999 });
+    assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 7);
+  }
+  assert.equal(logins, 1); assert.equal(refreshes, 3); assert.deepEqual(f.calls, ['account', 'households', 'boxes']);
+  assert.equal(events.filter(e => e.kind === 'renewal' && e.grant === 'refresh' && e.outcome === 'success').length, 3);
+  assert.equal(events.filter(e => e.kind === 'replacement' && e.phase === 'ready').length, 6);
+  assert.doesNotMatch(JSON.stringify([f.c.getStatus(), events]), /SYNTHETIC|accessToken|refreshToken|revision/);
+  f.c.stop(); assert.ok(transports.every(t => t.closed)); assert.equal(f.jobs.size, 0);
+});
+
+test('commissioning refusal metadata is narrowly projected and stale transitions remain suppressed', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } }); await f.begin();
+  const l = f.lifecycles[0];
+  l.options.onStatus({ phase: 'waiting-retry', connected: false, error: {
+    kind: 'authentication-refused', origin: 'disconnect', reasonCode: 135, message: 'SYNTHETIC_SECRET', packet: { private: true },
+  } }); await drain();
+  const event = events.filter(e => e.kind === 'lifecycle').at(-1);
+  assert.equal(event.origin, 'disconnect'); assert.equal(event.reasonCode, 135);
+  assert.doesNotMatch(JSON.stringify(events), /SYNTHETIC|packet|message/);
+  const before = events.length;
+  l.options.onStatus({ phase: 'connecting', connected: false, replacement: 'proactive' });
+  f.c.stop(); await drain(); assert.equal(events.length, before);
+});

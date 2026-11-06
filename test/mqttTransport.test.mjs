@@ -885,7 +885,7 @@ for (const reasonCode of [134, 135]) {
       }
     };
     const result = await f.start();
-    assert.deepEqual(result, { ok: false, error: { kind: 'authentication-refused', reasonCode } });
+    assert.deepEqual(result, { ok: false, error: { kind: 'authentication-refused', reasonCode, origin: 'error' } });
     await flush();
     assert.deepEqual(f.socket.sent.map(p => p.cmd), ['connect']);
     assert.equal((await f.start()).error.kind, 'closed');
@@ -925,5 +925,98 @@ test('default establishment timer is unreferenced and cancelled on disposal', as
     adapter?.close();
     timerMock.mock.restore();
     clearMock.mock.restore();
+  }
+});
+
+
+for (const reasonCode of [134, 135]) {
+  test('real parser refusal provenance for DISCONNECT ' + reasonCode, async t => {
+    const f = realFixture(t, acceptSubscriptions); assert.equal((await f.start()).ok, true);
+    f.socket.receive({ cmd: 'disconnect', reasonCode }); await flush();
+    // mqtt-packet rejects 134 as an invalid DISCONNECT reason before emitting a packet.
+    assert.deepEqual(f.adapter.getStatus().error, reasonCode === 135
+      ? { kind: 'authentication-refused', reasonCode, origin: 'disconnect' } : { kind: 'transport' });
+    assert.deepEqual(f.socket.sent.map(p => p.cmd), ['connect', 'subscribe']);
+  });
+}
+
+test('generic MQTT error 135 never claims broker DISCONNECT provenance', async t => {
+  const f = fixture(t); const p = f.start(); f.connected(); f.ack(); await p;
+  f.client.emit('error', { code: 135, message: 'SYNTHETIC_SECRET' });
+  assert.deepEqual(f.transport.getStatus().error, { kind: 'authentication-refused', reasonCode: 135, origin: 'error' });
+});
+
+
+test('real manager + lifecycle + guarded MQTT.js/ws sustain rotation and bounded broker recovery', async t => {
+  const { createTokenManager } = await import('../dist/toniebox/tokenManager.js');
+  const { createMqttLifecycle } = await import('../dist/toniebox/mqttLifecycle.js');
+  let mono = 0, logins = 0, refreshes = 0, serial = 0;
+  const jobs = new Set(), sessions = [], messages = [];
+  const scheduler = { schedule(callback, ms) {
+    const job = { callback, at: mono + ms }; jobs.add(job); return () => jobs.delete(job);
+  } };
+  const clock = { now: () => ({ monotonicMs: mono, wallMs: 1800000000000 + mono }) };
+  const grant = () => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_ACCESS_' + (++serial),
+    refreshToken: 'SYNTHETIC_REFRESH_' + serial, tokenType: 'Bearer', expiresInSeconds: 300 } });
+  const manager = createTokenManager({ clock, scheduler, authClient: {
+    login: async () => {
+      logins++; return grant();
+    }, refresh: async () => {
+      refreshes++; return grant();
+    },
+  } });
+  manager.setCredentials({ username: 'SYNTHETIC_USER', password: 'SYNTHETIC_PASSWORD' });
+  const context = new AbortController();
+  const lifecycle = createMqttLifecycle({ tokenProvider: manager, contextSignal: context.signal, accountUuid: credentials.uuid,
+    routes, onMessage: m => messages.push(m), clock: { now: () => mono }, scheduler, jitter: () => 0.5,
+    transportFactory: callbacks => {
+      assert.ok(sessions.every(s => s.adapter.getStatus().phase === 'closed'), 'Close before constructing a replacement');
+      const socket = new SyntheticSocket(), stream = createWebSocketStream(socket);
+      const adapter = createMqttTransport({ ...callbacks, clock, scheduler, streamFactory: () => stream });
+      socket.respond = p => {
+        if (p.cmd === 'connect') {
+          queueMicrotask(() => socket.receive({ cmd: 'connack', reasonCode: 0, sessionPresent: false }));
+        }
+        if (p.cmd === 'subscribe') {
+          queueMicrotask(() => {
+            socket.receive({ cmd: 'publish', topic: 'external/toniebox/SYNTHETIC-MAC/online-state',
+              payload: Buffer.from('{"onlineState":"disconnected"}'), qos: 0, retain: true });
+            socket.receive({ cmd: 'suback', messageId: p.messageId, granted: p.subscriptions.map(() => 1) });
+          });
+        }
+      };
+      sessions.push({ socket, stream, adapter }); return adapter;
+    },
+  });
+  const advance = async ms => {
+    mono += ms;
+    for (const j of [...jobs]) {
+      if (j.at <= mono && jobs.delete(j)) {
+        j.callback();
+      }
+    }
+    await flush();
+  };
+  t.after(async () => {
+    lifecycle.stop(); manager.stop(); context.abort(); await flush();
+    assert.equal(jobs.size, 0); assert.ok(sessions.every(s => s.stream.destroyed && s.socket.readyState === 3));
+    assert.equal(getEventListeners(context.signal, 'abort').length, 0);
+  });
+  lifecycle.start(); await flush();
+  for (let n = 2; n <= 4; n++) {
+    await advance(240000); assert.equal(lifecycle.getStatus().session, n);
+    assert.equal(messages.at(-1).session, n); assert.equal(messages.at(-1).retained, true);
+  }
+  sessions.at(-1).socket.receive({ cmd: 'disconnect', reasonCode: 135 }); await flush();
+  await advance(10000); assert.equal(sessions.length, 4);
+  await advance(230000); assert.equal(sessions.length, 5); assert.equal(lifecycle.getStatus().replacement, 'recovery');
+  await advance(240000); assert.equal(sessions.length, 6); assert.equal(lifecycle.getStatus().replacement, 'proactive');
+  assert.equal(logins, 1); assert.equal(refreshes, 5); assert.equal(messages.length, 6);
+  assert.deepEqual(sessions.map(s => s.socket.sent.filter(p => p.cmd === 'connect').length), [1,1,1,1,1,1]);
+  assert.equal(new Set(sessions.map(s => s.socket.sent.find(p => p.cmd === 'connect').password.toString())).size, 6);
+  for (const s of sessions) {
+    assert.equal(s.socket.sent.filter(p => p.cmd === 'subscribe').length, 1);
+    assert.equal(s.socket.sent.find(p => p.cmd === 'subscribe').subscriptions.length, 7);
+    assert.equal(s.socket.sent.some(p => p.cmd === 'publish'), false);
   }
 });

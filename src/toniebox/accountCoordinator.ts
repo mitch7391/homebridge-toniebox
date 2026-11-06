@@ -40,8 +40,16 @@ function safeStatus(raw: MqttLifecycleStatus): MqttLifecycleStatus {
   }
   const kind = kinds.find(k => k === raw.error?.kind);
   const tokenFailure = tokenKinds.find(k => k === raw.error?.tokenFailure);
+  const origin = raw.error?.origin;
+  const reasonCode = raw.error?.reasonCode;
+  const replacement = raw.replacement;
   return { phase, connected: phase === 'ready', ...(phase === 'ready' ? { session: raw.session } : {}),
-    ...(kind ? { error: { kind, ...(tokenFailure ? { tokenFailure } : {}) } } : {}),
+    ...(kind ? { error: { kind, ...(tokenFailure ? { tokenFailure } : {}),
+      ...(kind === 'authentication-refused' && (origin === 'disconnect' || origin === 'error')
+        ? { origin } : {}),
+      ...(kind === 'authentication-refused' && (reasonCode === 134 || reasonCode === 135)
+        ? { reasonCode } : {}) } } : {}),
+    ...(replacement === 'proactive' || replacement === 'recovery' ? { replacement } : {}),
     ...(number(raw.retryAfterMs) ? { retryAfterMs: raw.retryAfterMs } : {}) };
 }
 function policyCopy(value?: CompatibilityPolicy): CompatibilityPolicy | undefined {
@@ -217,6 +225,22 @@ class Coordinator implements AccountCoordinator {
       const c: Context = { key: Symbol(), controller: new AbortController(), experiments: new Map(), started: false };
       this.#context = c;
       this.#commissioning?.reset();
+      if (this.#commissioning) {
+        let grantKey = '';
+        this.#tokens.observeCredentials(snapshot => {
+          if (!this.#current(c)) {
+            return;
+          }
+          const grant = snapshot.grant;
+          const key = grant ? JSON.stringify([snapshot.revision, grant.kind, grant.outcome, grant.accessChanged]) : '';
+          if (key !== grantKey) {
+            grantKey = key;
+            if (grant) {
+              quiet(() => this.#commissioning!.renewal(grant, () => this.#current(c)));
+            }
+          }
+        }, { signal: c.controller.signal });
+      }
       const client = this.#options.discoveryClient ?? createDiscoveryClient();
       const request = async <T>(invoke: () => Promise<DiscoveryResult<T>>, options?: DiscoveryRequestOptions): Promise<DiscoveryResult<T>> => {
         if (!this.#current(c) || options?.signal?.aborted) {
@@ -321,10 +345,12 @@ class Coordinator implements AccountCoordinator {
           if (this.#commissioning) {
             quiet(() => {
               previouslyReady ||= status.phase === 'ready';
-              const key = JSON.stringify([status.phase, status.session, status.error?.kind, status.error?.tokenFailure]);
+              const key = JSON.stringify([status.phase, status.session, status.error?.kind, status.error?.tokenFailure,
+                status.error?.origin, status.error?.reasonCode, status.replacement]);
               if (key !== diagnosticKey) {
                 diagnosticKey = key;
                 const transition = diagnosticTransition = {};
+                this.#commissioning!.replacement(plan.lane, status, () => live() && diagnosticTransition === transition);
                 this.#commissioning!.lifecycle(plan.lane, status, previouslyReady,
                   () => live() && diagnosticTransition === transition);
               }

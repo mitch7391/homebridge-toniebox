@@ -14,8 +14,8 @@ let forbiddenTest = 0;
 const { AbortController } = globalThis;
 const secret = 'SYNTHETIC_PRIVATE_VALUE';
 const routePlan = [{ routeId: 'SYNTHETIC_ROUTE', macAddress: 'SYNTHETIC_MAC' }];
-const access = (remainingLifetimeMs = 300000, accessToken = 'SYNTHETIC_TOKEN') =>
-  ({ ok: true, tokenType: 'Bearer', remainingLifetimeMs, accessToken });
+const access = (remainingLifetimeMs = 300000, accessToken = 'SYNTHETIC_TOKEN', revision = 1) =>
+  ({ ok: true, tokenType: 'Bearer', remainingLifetimeMs, accessToken, revision });
 const failure = kind => ({ ok: false, error: { kind } });
 const message = {
   routeId: routePlan[0].routeId, topic: 'external/toniebox/SYNTHETIC_MAC/volume/state',
@@ -80,11 +80,29 @@ function fixture(t, overrides = {}) {
     maxTimers = Math.max(maxTimers, jobs.size);
     return () => jobs.delete(job);
   } };
-  const provider = { getAccessToken(request) {
-    tokenCalls.push(request);
-    const value = tokens.length ? tokens.shift() : access();
-    return typeof value === 'function' ? value(request) : Promise.resolve(value);
-  } };
+  const observers = new Set();
+  let credentialStatus = { renewal: 'ready', operation: 'idle', access: 'usable' };
+  let credential = access();
+  const provider = {
+    getStatus: () => ({ ...credentialStatus }),
+    observeCredentials(observer, { signal } = {}) {
+      observers.add(observer);
+      const remove = () => {
+        observers.delete(observer); signal?.removeEventListener('abort', remove);
+      };
+      signal?.addEventListener('abort', remove, { once: true });
+      void Promise.resolve().then(() => {
+        if (observers.has(observer)) {
+          observer({ revision: credential.revision, status: credentialStatus });
+        }
+      });
+      return remove;
+    },
+    getAccessToken(request) {
+      tokenCalls.push(request);
+      const value = tokens.length ? tokens.shift() : credential;
+      return typeof value === 'function' ? value(request) : Promise.resolve(value);
+    } };
   const factory = callbacks => {
     assert.ok(transports.every(value => value.closes > 0), 'Previous transport must be closed first');
     const pending = deferred();
@@ -133,6 +151,14 @@ function fixture(t, overrides = {}) {
   });
   return {
     lifecycle, context, jobs, history, tokenCalls, tokens, transports, statuses, messages, options, scheduler, provider, factory,
+    renew(revision, status = credentialStatus) {
+      credential = access(300000, 'SYNTHETIC_TOKEN_' + revision, revision);
+      credentialStatus = status;
+      for (const observer of observers) {
+        observer({ revision, status });
+      }
+    },
+    observers,
     setTime(value) {
       mono = value;
     },
@@ -191,7 +217,7 @@ test('ready notification can reenter ready without allocating another session', 
   await f.start(); f.transport.ready(); f.transport.ready();
   assert.equal(notifications, 1); assert.equal(f.lifecycle.getStatus().session, 1);
 });
-test('healthy connection survives arbitrary token changes and elapsed lifetime without token polling', async t => {
+test('healthy connection has no token polling without a credential notification', async t => {
   const f = fixture(t); await f.start(); f.transport.ready(); f.transport.pending.resolve({ ok: true });
   f.tokens.push(access(300000, 'SYNTHETIC_REPLACEMENT'));
   await f.advance(86400000);
@@ -429,7 +455,8 @@ for (const options of [
 ]) {
   test('invalid construction rejected safely ' + JSON.stringify(options), () => {
     assert.throws(() => createMqttLifecycle({
-      tokenProvider: { getAccessToken() {} }, routes: routePlan, accountUuid: 'SYNTHETIC',
+      tokenProvider: { getAccessToken: async () => access(), getStatus: () => ({ renewal: 'ready' }),
+        observeCredentials: () => () => undefined }, routes: routePlan, accountUuid: 'SYNTHETIC',
       contextSignal: new AbortController().signal, onMessage() {}, ...options,
     }), { message: 'Invalid MQTT lifecycle options' });
   });
@@ -624,7 +651,7 @@ test('real 5A readiness drains retained messages with session before connect pro
     assert.equal(client.listenerCount(name), 0);
   }
 });
-test('real 3B proactive refresh does not disturb a healthy MQTT connection', async t => {
+test('real 3B proactive refresh replaces the transport without an additional password grant', async t => {
   let mono = 0;
   const jobs = new Set(); let logins = 0; let refreshes = 0;
   const manager = createTokenManager({
@@ -650,14 +677,15 @@ test('real 3B proactive refresh does not disturb a healthy MQTT connection', asy
   });
   manager.setCredentials({ username: 'SYNTHETIC_USER', password: 'SYNTHETIC_PASSWORD' });
   const f = fixture(t, { tokenProvider: manager }); await f.start(); f.transport.ready(); f.transport.pending.resolve({ ok: true });
-  mono = 240000;
+  mono = 240000; f.setTime(mono);
   for (const job of [...jobs]) {
     if (job.at <= mono && jobs.delete(job)) {
       job.callback();
     }
   }
   await flush(); assert.equal(logins, 1); assert.equal(refreshes, 1);
-  assert.equal(f.lifecycle.getStatus().phase, 'ready'); assert.equal(f.transport.closes, 0);
+  assert.equal(f.lifecycle.getStatus().phase, 'connecting'); assert.equal(f.transports.length, 2);
+  assert.equal(f.transports[0].closes, 1); f.transport.ready();
   f.transport.fail(); await f.advance(10000);
   assert.equal(f.transport.calls[0].credentials.accessToken, 'SYNTHETIC_ROTATED');
   f.lifecycle.stop(); assert.notEqual(manager.getStatus().renewal, 'stopped');
@@ -886,4 +914,333 @@ test('slow disposal does not turn a brief connection into a stable one', async t
     f.setTime(f.mono + 2); close();
   };
   f.transport.fail(); assert.equal(f.lifecycle.getStatus().retryAfterMs, 20000);
+});
+
+
+function refusal(f, reasonCode = 135, origin = 'disconnect') {
+  f.transport.callbacks.onStatus({ phase: 'closed', error: { kind: 'authentication-refused', reasonCode, origin } });
+}
+function established(f) {
+  f.transport.ready(); f.transport.pending.resolve({ ok: true });
+}
+
+test('three proactive rotations preserve one transport and allocate sessions before first buffered messages', async t => {
+  const f = fixture(t); await f.start(); established(f);
+  for (let n = 2; n <= 4; n++) {
+    const old = f.transport; await f.advance(240000); f.renew(n); f.renew(n); await flush();
+    assert.equal(old.closes, 1); assert.equal(f.transports.length, n); assert.equal(f.tokenCalls.length, n);
+    assert.equal(f.transport.calls[0].credentials.accessToken, 'SYNTHETIC_TOKEN_' + n);
+    established(f); f.transport.callbacks.onMessage(message);
+    old.callbacks.onMessage(message); old.callbacks.onStatus({ phase: 'ready' });
+    assert.equal(f.messages.at(-1).session, n); assert.equal(f.messages.length, n - 1);
+  }
+  assert.equal(f.lifecycle.getStatus().session, 4);
+});
+
+test('same revision and failed/backoff renewal preserve a healthy transport without grants', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  f.renew(1); f.renew(1, { renewal: 'backoff', retryAfterMs: 30000 }); await flush();
+  assert.equal(f.transports.length, 1); assert.equal(f.tokenCalls.length, 1); assert.equal(f.transport.closes, 0);
+});
+
+test('slow replacement acquisition preserves live delivery and coalesces newer notifications', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  const pending = deferred(); f.tokens.push(pending.promise); f.renew(2); await flush(); const old = f.transport;
+  old.callbacks.onMessage(message); assert.equal(f.messages.length, 1); assert.equal(old.closes, 0);
+  f.renew(3); f.renew(3); pending.resolve(access(300000, 'SYNTHETIC_TOKEN_3', 3)); await flush();
+  established(f); await flush(); assert.equal(f.transports.length, 2); assert.equal(f.tokenCalls.length, 2);
+});
+
+test('renewal while connecting waits for readiness and enforces minimum CONNECT spacing', async t => {
+  const f = fixture(t); await f.start(); f.renew(2); await flush(); assert.equal(f.transports.length, 1);
+  established(f); f.transport.callbacks.onMessage(message); await flush();
+  assert.equal(f.messages[0].session, 1); assert.equal(f.jobs.size, 1);
+  await f.advance(9999); assert.equal(f.transports.length, 1);
+  await f.advance(1); assert.equal(f.transports.length, 2);
+});
+
+test('renewal never shortens existing failure backoff', async t => {
+  const f = fixture(t); await f.start(); f.transport.fail(); await f.advance(10000); f.transport.fail();
+  f.renew(2); await flush(); await f.advance(19999); assert.equal(f.transports.length, 2);
+  await f.advance(1); assert.equal(f.transports.length, 3);
+  assert.equal(f.transport.calls[0].credentials.accessToken, 'SYNTHETIC_TOKEN_2');
+});
+
+for (const point of ['preparation', 'connecting', 'spacing', 'ready', 'recovery']) {
+  for (const invalidation of [false, true]) {
+    test('terminal cleanup during ' + point + (invalidation ? ' invalidation' : ' stop'), async t => {
+      const f = fixture(t); await f.start(); established(f); const old = f.transport; const pending = deferred();
+      if (point === 'recovery') {
+        refusal(f);
+      } else {
+        if (point !== 'spacing') {
+          await f.advance(240000);
+        }
+        if (point === 'preparation') {
+          f.tokens.push(pending.promise);
+        }
+        f.renew(2); await flush();
+        if (point === 'ready') {
+          established(f);
+        }
+      }
+      if (invalidation) {
+        f.context.abort();
+      } else {
+        f.lifecycle.stop();
+      }
+      const count = f.transports.length; pending.resolve(access(300000, 'SYNTHETIC_LATE', 2));
+      old.callbacks.onMessage(message); old.callbacks.onStatus({ phase: 'ready' });
+      f.renew(3); await flush(); await f.advance(999999);
+      assert.equal(f.transports.length, count); assert.equal(f.messages.length, 0);
+      assert.equal(f.lifecycle.getStatus().phase, 'stopped'); assert.equal(f.observers.size, 0);
+    });
+  }
+}
+
+for (const origin of ['error', undefined, 'PRIVATE']) {
+  test('post-ready authentication without proven DISCONNECT is terminal: ' + origin, async t => {
+    const f = fixture(t); await f.start(); established(f);
+    f.transport.callbacks.onStatus({ phase: 'closed', error: { kind: 'authentication-refused', reasonCode: 135, origin } });
+    f.renew(2); await f.advance(300000); assert.equal(f.transports.length, 1);
+    assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+    assert.doesNotMatch(JSON.stringify(f.lifecycle.getStatus()), /PRIVATE/);
+  });
+}
+for (const code of [134, undefined, '135', 999]) {
+  test('post-ready reason never implies expiry: ' + code, async t => {
+    const f = fixture(t); await f.start(); established(f);
+    f.transport.callbacks.onStatus({ phase: 'closed', error: { kind: 'authentication-refused', reasonCode: code, origin: 'disconnect' } });
+    assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+  });
+}
+
+test('initial and proactively replaced pre-ready authentication refusal remain terminal', async t => {
+  const a = fixture(t); await a.start(); refusal(a); assert.equal(a.lifecycle.getStatus().phase, 'attention-required');
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000); f.renew(2); await flush();
+  refusal(f); f.renew(3); await f.advance(300000); assert.equal(f.transports.length, 2);
+  assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+});
+
+test('qualifying refusal waits without polling and never reuses rejected revision', async t => {
+  const f = fixture(t); await f.start(); established(f); refusal(f); await f.advance(300000);
+  assert.equal(f.transports.length, 1); assert.equal(f.tokenCalls.length, 1); assert.equal(f.jobs.size, 0);
+  f.renew(1); await flush(); assert.equal(f.tokenCalls.length, 1);
+  f.renew(2); await flush(); assert.equal(f.transports.length, 2);
+  assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+});
+
+for (const readyFirst of [false, true]) {
+  test('recovery credential rejection is terminal even after readiness: ' + readyFirst, async t => {
+    const f = fixture(t); await f.start(); established(f); refusal(f);
+    f.renew(2); await f.advance(10000); if (readyFirst) {
+      established(f);
+    }
+    refusal(f); f.renew(3); await f.advance(300000);
+    assert.equal(f.lifecycle.getStatus().phase, 'attention-required'); assert.equal(f.transports.length, 2);
+  });
+}
+
+test('later ordinary rotation completes recovery and future independent incidents remain recoverable', async t => {
+  const f = fixture(t); await f.start(); established(f);
+  for (const [candidate, ordinary] of [[2,3], [4,5], [6,7]]) {
+    refusal(f); f.renew(candidate); await f.advance(f.lifecycle.getStatus().retryAfterMs); established(f);
+    assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+    await f.advance(240000); f.renew(ordinary); await flush(); established(f);
+    assert.equal(f.lifecycle.getStatus().replacement, 'proactive');
+  }
+  assert.equal(f.transports.length, 7); assert.equal(f.lifecycle.getStatus().session, 7);
+});
+
+test('pre-ready recovery transport failure consumes candidate and preserves backoff for newer revision', async t => {
+  const f = fixture(t); await f.start(); established(f); refusal(f); f.renew(2); await f.advance(10000);
+  f.transport.fail(); f.renew(2); await f.advance(20000);
+  assert.equal(f.transports.length, 2); assert.equal(f.jobs.size, 0);
+  f.renew(3); await flush(); assert.equal(f.transports.length, 3); assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+});
+
+test('concurrent proactive preparation and refusal coalesce into a single recovery', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  const pending = deferred(); f.tokens.push(pending.promise); f.renew(2); await flush();
+  refusal(f); pending.resolve(access(300000, 'SYNTHETIC_TOKEN_2', 2)); await flush();
+  assert.equal(f.transports.length, 1); await f.advance(10000);
+  assert.equal(f.transports.length, 2); assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+});
+
+test('locally usable token under terminal manager attention cannot authorise replacement or recovery', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  f.renew(2, { renewal: 'attention-required', reason: 'authentication-failed' }); await flush();
+  assert.equal(f.transports.length, 1); assert.equal(f.transport.closes, 0);
+  refusal(f); await f.advance(10000); await flush();
+  assert.equal(f.transports.length, 1); assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+});
+
+for (const missing of ['revision', 'getStatus', 'observeCredentials']) {
+  test('revision-aware dependency is mandatory: ' + missing, async t => {
+    if (missing === 'revision') {
+      const f = fixture(t); const raw = access(); delete raw.revision; f.tokens.push(raw); await f.start();
+      assert.equal(f.lifecycle.getStatus().error.kind, 'dependency'); assert.equal(f.transports.length, 0);
+    } else {
+      const provider = { getAccessToken: async () => access(), getStatus: () => ({ renewal: 'ready' }), observeCredentials: () => () => {} };
+      delete provider[missing];
+      assert.throws(() => fixture(t, { tokenProvider: provider }), /Invalid MQTT lifecycle options/);
+    }
+  });
+}
+
+
+test('reentrant shutdown from preparation abort cannot revive the retired connection', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  f.tokens.push(({ signal }) => {
+    signal.addEventListener('abort', () => f.lifecycle.stop(), { once: true });
+    return Promise.resolve(access(300000, 'SYNTHETIC_NEW', 2));
+  });
+  f.renew(2); await flush();
+  assert.equal(f.lifecycle.getStatus().phase, 'stopped'); assert.equal(f.transports.length, 1);
+  assert.equal(f.transport.closes, 1);
+});
+
+test('reentrant shutdown on replacement transition closes retiring transport before callback returns', async t => {
+  let f;
+  f = fixture(t, { onStatus(status) {
+    if (status.phase === 'connecting' && status.replacement === 'proactive') {
+      f.lifecycle.stop(); assert.equal(f.transports[0].closes, 1);
+    }
+  } });
+  await f.start(); established(f); await f.advance(240000); f.renew(2); await flush();
+  assert.equal(f.lifecycle.getStatus().phase, 'stopped'); assert.equal(f.transports.length, 1);
+});
+
+test('late preparation rejection is absorbed after a qualifying refusal', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  const pending = deferred(); f.tokens.push(pending.promise); f.renew(2); await flush();
+  refusal(f); pending.reject(new Error(secret)); await flush(); await f.advance(10000);
+  assert.equal(f.transports.length, 2); assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+});
+
+for (const mode of ['throw', 'invalid-cleanup', 'reentrant-stop']) {
+  test('credential subscription failure containment ' + mode, async t => {
+    const f = fixture(t);
+    f.provider.observeCredentials = () => {
+      if (mode === 'throw') {
+        throw new Error(secret);
+      }
+      if (mode === 'reentrant-stop') {
+        f.lifecycle.stop(); return () => {};
+      }
+      return null;
+    };
+    await f.start(); assert.equal(f.tokenCalls.length, 0); assert.equal(f.transports.length, 0);
+    assert.equal(f.lifecycle.getStatus().phase, mode === 'reentrant-stop' ? 'stopped' : 'attention-required');
+  });
+}
+
+test('renewal status sampling cannot conceal candidate ageing before retiring a healthy transport', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  const getStatus = f.provider.getStatus; let sampled = false;
+  f.tokens.push(() => {
+    f.provider.getStatus = () => {
+      if (sampled) {
+        f.setTime(f.mono + 300000);
+      } sampled = true; return getStatus();
+    };
+    return Promise.resolve(access(31000, 'SYNTHETIC_SHORT', 2));
+  });
+  f.renew(2); await flush(); assert.equal(f.transports.length, 1); assert.equal(f.transport.closes, 0);
+});
+
+
+test('a newer notification supersedes a pending candidate before any old-session disruption', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  const old = f.transport, pending = deferred(); f.tokens.push(pending.promise); f.renew(2); await flush();
+  f.renew(3); pending.resolve(access(300000, 'SYNTHETIC_SUPERSEDED', 2)); await flush();
+  assert.equal(old.closes, 1); assert.equal(f.transports.length, 2);
+  assert.equal(f.transport.calls[0].credentials.accessToken, 'SYNTHETIC_TOKEN_3');
+});
+
+test('too-short renewal candidate retains healthy connection without repeated acquisition', async t => {
+  const f = fixture(t); await f.start(); established(f); await f.advance(240000);
+  f.tokens.push(access(30000, 'SYNTHETIC_SHORT', 2)); f.renew(2); await flush();
+  assert.equal(f.transport.closes, 0); assert.equal(f.jobs.size, 0); assert.equal(f.tokenCalls.length, 2);
+});
+
+test('renewal spacing scheduler failure closes safely and cannot create a second transport', async t => {
+  const f = fixture(t); await f.start(); established(f);
+  f.scheduler.schedule = () => {
+    throw new Error(secret);
+  };
+  f.renew(2); await flush(); assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+  assert.equal(f.transports.length, 1); assert.equal(f.transport.closes, 1);
+});
+
+for (const status of [401, 429, 503]) {
+  test('real manager refresh failure ' + status + ' preserves grant ownership and MQTT safety', async t => {
+    let f, mono = 0, logins = 0, refreshes = 0; const jobs = new Set();
+    const pair = name => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_' + name, refreshToken: 'SYNTHETIC_REFRESH_' + name,
+      expiresInSeconds: 300, tokenType: 'Bearer' } });
+    const manager = createTokenManager({ clock: { now: () => ({ monotonicMs: mono, wallMs: mono }) },
+      scheduler: { schedule(fn, ms) {
+        const job = { fn, at: mono + ms }; jobs.add(job); return () => jobs.delete(job);
+      } },
+      authClient: { login: async () => {
+        logins++; return pair(logins);
+      },
+      refresh: async () => {
+        refreshes++; return { ok: false, error: { kind: 'http', status, oauthError: 'invalid_client' } };
+      } },
+    });
+    t.after(() => {
+      manager.stop(); assert.equal(jobs.size, 0);
+    });
+    manager.setCredentials({ username: 'SYNTHETIC_USER', password: 'SYNTHETIC_PASSWORD' });
+    f = fixture(t, { tokenProvider: manager }); await f.start(); established(f);
+    mono = 240000; f.setTime(mono);
+    for (const j of [...jobs]) {
+      if (j.at <= mono && jobs.delete(j)) {
+        j.fn();
+      }
+    } await flush();
+    assert.equal(logins, 1); assert.equal(refreshes, 1); assert.equal(f.transport.closes, 0);
+    assert.equal((await manager.getAccessToken()).ok, true);
+    refusal(f); await f.advance(10000); assert.equal(f.transports.length, 1);
+    if (status === 503) {
+      mono += 30000; f.setTime(mono);
+      for (const j of [...jobs]) {
+        if (j.at <= mono && jobs.delete(j)) {
+          j.fn();
+        }
+      } await flush();
+      assert.equal(logins, 2); assert.equal(f.transports.length, 2); assert.equal(f.lifecycle.getStatus().replacement, 'recovery');
+    } else {
+      assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+      assert.equal(manager.getStatus().renewal, 'attention-required'); assert.equal(logins, 1);
+    }
+  });
+}
+
+
+test('authentication provenance reads changing getters once and cannot leak unvalidated fields', async t => {
+  const f = fixture(t); await f.start(); established(f); let origins = 0, codes = 0;
+  f.transport.callbacks.onStatus({ phase: 'closed', error: { kind: 'authentication-refused',
+    get origin() {
+      return ++origins === 1 ? 'error' : secret;
+    },
+    get reasonCode() {
+      return ++codes === 1 ? 135 : secret;
+    },
+  } });
+  assert.equal(origins, 1); assert.equal(codes, 1);
+  assert.equal(f.lifecycle.getStatus().phase, 'attention-required');
+  assert.deepEqual(f.lifecycle.getStatus().error, { kind: 'authentication-refused', origin: 'error', reasonCode: 135 });
+});
+
+test('terminal credential status projects a changing reason getter without private data', async t => {
+  const f = fixture(t); let reads = 0;
+  f.provider.getStatus = () => ({ renewal: 'attention-required',
+    get reason() {
+      return ++reads === 1 ? 'authentication-failed' : secret;
+    },
+  });
+  await f.start(); assert.equal(f.tokenCalls.length, 0); assert.equal(reads, 1);
+  assert.deepEqual(f.lifecycle.getStatus().error, { kind: 'token', tokenFailure: 'authentication-failed' });
 });
