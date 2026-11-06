@@ -287,3 +287,37 @@ for (const phase of ['acquiring-token','connecting','ready','waiting-retry']) {
     assert.equal(f.calls.filter(x=>x==='stop').length,1); assert.equal(f.calls.filter(x=>x==='discover').length,1);
   });
 }
+
+test('commissioning build switch is explicitly disabled and normal logs contain no commissioning records', async () => {
+  const { COMMISSIONING_BUILD } = await import('../dist/toniebox/commissioning.js');
+  assert.equal(COMMISSIONING_BUILD, false);
+  const f = fixture(); f.runtime.launch(); await drain(); f.runtime.stop();
+  assert.doesNotMatch(f.logs.join(), /commissioning/);
+});
+
+test('commissioning build activation wires bounded observer and suppresses late logger delivery', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { Buffer } = await import('node:buffer');
+  const { URL } = await import('node:url');
+  const fakeSource = 'export const calls=[]; export let observer; export function createAccountCoordinator(o) {'
+    + 'observer=o.onCommissioning; calls.push("create"); return {'
+    + 'setCredentials(){calls.push("credentials"); return {ok:true}},'
+    + 'start(){calls.push("start"); return {ok:true}},'
+    + 'discover(){calls.push("discover"); return Promise.resolve({ok:true,recovery:{disposition:"none",reason:"complete",coverage:"complete"}})},'
+    + 'stop(){calls.push("stop")}}}';
+  const fakeUrl='data:text/javascript;base64,'+Buffer.from(fakeSource).toString('base64');
+  const fake=await import(fakeUrl);
+  const runtimeUrl=new URL('../dist/platformRuntime.js',import.meta.url);
+  let source=readFileSync(runtimeUrl,'utf8');
+  assert.ok(source.includes('import { COMMISSIONING_BUILD }'));
+  source=source.replace(/import \{ COMMISSIONING_BUILD \} from '[^']+';/, 'const COMMISSIONING_BUILD = true;');
+  source=source.replace('\'./toniebox/accountCoordinator.js\'',JSON.stringify(fakeUrl));
+  const { PlatformRuntime: EnabledRuntime }=await import('data:text/javascript;base64,'+Buffer.from(source).toString('base64'));
+  const logs=[]; const runtime=new EnabledRuntime(credentials,{ info:m=>logs.push(m),warn:m=>logs.push(m) });
+  runtimes.push(runtime); assert.deepEqual(fake.calls,[]); assert.deepEqual(logs,[]);
+  runtime.launch(); await drain(); assert.equal(typeof fake.observer,'function');
+  fake.observer({ kind:'session',lane:'production',established:1 });
+  assert.match(logs.join(),/commissioning diagnostics active/); assert.match(logs.join(),/established/);
+  runtime.stop(); const n=logs.length; fake.observer({ kind:'session',lane:'production',established:2 });
+  assert.equal(logs.length,n); assert.deepEqual(fake.calls,['create','credentials','start','discover','stop']);
+});

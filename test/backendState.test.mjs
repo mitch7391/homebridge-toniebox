@@ -374,7 +374,8 @@ test('actual 5A + 5B deliver first buffered message into mapped state before con
   let client;
   const lifecycle = createMqttLifecycle({
     accountUuid: 'SYNTHETIC_ACCOUNT', routes: plan().routes, contextSignal: controller.signal,
-    tokenProvider: { getAccessToken: async () => ({ ok: true, tokenType: 'Bearer', accessToken: 'SYNTHETIC_ACCESS', remainingLifetimeMs: 300000 }) },
+    tokenProvider: { getStatus: () => ({ renewal: 'ready' }), observeCredentials: () => () => undefined,
+      getAccessToken: async () => ({ ok: true, tokenType: 'Bearer', accessToken: 'SYNTHETIC_ACCESS', remainingLifetimeMs: 300000, revision: 1 }) },
     onStatus: f.binding.onStatus, onMessage: f.binding.onMessage,
     clock: { now: () => 0 }, scheduler, jitter: () => 0.5,
     transportFactory: callbacks => createMqttTransport({
@@ -473,3 +474,19 @@ for (const connected of [false, true]) {
     assert.equal(f.state.getStatus().phase, 'connected');
   });
 }
+
+
+test('same binding preserves last-known state across proactive and recovery replacement sessions', () => {
+  const f = fixture(); active(f);
+  for (let session = 2; session <= 4; session++) {
+    const cause = session === 2 ? 'recovery' : 'proactive';
+    assert.equal(f.binding.onStatus({ phase: 'connecting', connected: false, replacement: cause }).accepted, true);
+    assert.equal(f.get().freshness['playback/state'], 'last-known');
+    assert.equal(f.binding.onMessage(message('volume/state', { level: 99 }, { session: session - 1 })).accepted, false);
+    assert.equal(f.binding.onStatus({ ...ready(session), replacement: cause }).accepted, true);
+    assert.equal(f.binding.onMessage(message('volume/state', { level: session }, { session, retained: true })).accepted, true);
+    assert.equal(f.get().freshness['volume/state'], 'retained');
+    assert.equal(f.get().state.topics['playback/state'].session, 1);
+    assert.notEqual(f.get().playback, 'playing');
+  }
+});

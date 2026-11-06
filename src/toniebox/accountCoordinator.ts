@@ -1,3 +1,4 @@
+import { CommissioningObserver } from './commissioning.js';
 import { performance } from 'node:perf_hooks';
 import { createAuthClient } from './authClient.js';
 import { createTokenManager } from './tokenManager.js';
@@ -39,8 +40,16 @@ function safeStatus(raw: MqttLifecycleStatus): MqttLifecycleStatus {
   }
   const kind = kinds.find(k => k === raw.error?.kind);
   const tokenFailure = tokenKinds.find(k => k === raw.error?.tokenFailure);
+  const origin = raw.error?.origin;
+  const reasonCode = raw.error?.reasonCode;
+  const replacement = raw.replacement;
   return { phase, connected: phase === 'ready', ...(phase === 'ready' ? { session: raw.session } : {}),
-    ...(kind ? { error: { kind, ...(tokenFailure ? { tokenFailure } : {}) } } : {}),
+    ...(kind ? { error: { kind, ...(tokenFailure ? { tokenFailure } : {}),
+      ...(kind === 'authentication-refused' && (origin === 'disconnect' || origin === 'error')
+        ? { origin } : {}),
+      ...(kind === 'authentication-refused' && (reasonCode === 134 || reasonCode === 135)
+        ? { reasonCode } : {}) } } : {}),
+    ...(replacement === 'proactive' || replacement === 'recovery' ? { replacement } : {}),
     ...(number(raw.retryAfterMs) ? { retryAfterMs: raw.retryAfterMs } : {}) };
 }
 function policyCopy(value?: CompatibilityPolicy): CompatibilityPolicy | undefined {
@@ -81,6 +90,7 @@ const unavailable: DiscoveryRunResult = { ok: false, error: { kind: 'request' },
 
 class Coordinator implements AccountCoordinator {
   readonly #options: AccountCoordinatorOptions;
+  readonly #commissioning?: CommissioningObserver;
   readonly #clock: TokenClock;
   readonly #tokens: TokenManager;
   #context?: Context;
@@ -95,6 +105,9 @@ class Coordinator implements AccountCoordinator {
 
   constructor(options: AccountCoordinatorOptions) {
     this.#options = { ...options };
+    if (typeof options.onCommissioning === 'function') {
+      this.#commissioning = new CommissioningObserver(options.onCommissioning);
+    }
     this.#clock = options.clock ?? { now: () => ({ monotonicMs: performance.now(), wallMs: Date.now() }) };
     this.#tokens = createTokenManager({ authClient: options.authClient ?? createAuthClient(), clock: this.#clock, scheduler: options.scheduler });
     this.#policy = policyCopy(options.policy);
@@ -211,6 +224,23 @@ class Coordinator implements AccountCoordinator {
       this.#credentials = value;
       const c: Context = { key: Symbol(), controller: new AbortController(), experiments: new Map(), started: false };
       this.#context = c;
+      this.#commissioning?.reset();
+      if (this.#commissioning) {
+        let grantKey = '';
+        this.#tokens.observeCredentials(snapshot => {
+          if (!this.#current(c)) {
+            return;
+          }
+          const grant = snapshot.grant;
+          const key = grant ? JSON.stringify([snapshot.revision, grant.kind, grant.outcome, grant.accessChanged]) : '';
+          if (key !== grantKey) {
+            grantKey = key;
+            if (grant) {
+              quiet(() => this.#commissioning!.renewal(grant, () => this.#current(c)));
+            }
+          }
+        }, { signal: c.controller.signal });
+      }
       const client = this.#options.discoveryClient ?? createDiscoveryClient();
       const request = async <T>(invoke: () => Promise<DiscoveryResult<T>>, options?: DiscoveryRequestOptions): Promise<DiscoveryResult<T>> => {
         if (!this.#current(c) || options?.signal?.aborted) {
@@ -291,6 +321,9 @@ class Coordinator implements AccountCoordinator {
       throw new Error('Invalid binding');
     }
     const live = (): boolean => this.#current(c) && slot.active;
+    let previouslyReady = false;
+    let diagnosticTransition: object = {};
+    let diagnosticKey = '';
     const lifecycle = (this.#options.lifecycleFactory ?? createMqttLifecycle)({
       tokenProvider: this.#tokens, accountUuid: plan.accountUuid, routes: plan.routes, contextSignal: c.controller.signal,
       clock: { now: () => this.#now() }, scheduler: this.#options.scheduler,
@@ -307,7 +340,25 @@ class Coordinator implements AccountCoordinator {
             }
             throw new Error('State contract');
           }
+          const newSession = status.phase === 'ready' && slot.status.session !== status.session;
           slot.status = status;
+          if (this.#commissioning) {
+            quiet(() => {
+              previouslyReady ||= status.phase === 'ready';
+              const key = JSON.stringify([status.phase, status.session, status.error?.kind, status.error?.tokenFailure,
+                status.error?.origin, status.error?.reasonCode, status.replacement]);
+              if (key !== diagnosticKey) {
+                diagnosticKey = key;
+                const transition = diagnosticTransition = {};
+                this.#commissioning!.replacement(plan.lane, status, () => live() && diagnosticTransition === transition);
+                this.#commissioning!.lifecycle(plan.lane, status, previouslyReady,
+                  () => live() && diagnosticTransition === transition);
+              }
+            });
+          }
+          if (newSession && this.#commissioning) {
+            quiet(() => this.#commissioning!.session(plan.lane, () => live() && slot.status.session === status.session));
+          }
           this.#refresh(c); this.#notify();
         } catch {
           if (live()) {
@@ -317,7 +368,11 @@ class Coordinator implements AccountCoordinator {
       },
       onMessage: message => {
         if (live()) {
-          bound.binding.onMessage(message);
+          const applied = bound.binding.onMessage(message);
+          if (this.#commissioning && live()) {
+            quiet(() => this.#commissioning!.message(plan.lane, message, applied,
+              () => slot.state.getDevice(message.routeId), () => live() && slot.status.phase === 'ready' && slot.status.session === message.session));
+          }
         }
       },
     });
@@ -376,6 +431,10 @@ class Coordinator implements AccountCoordinator {
       if (!c.experiments.has(id)) {
         c.uuid = plan.accountUuid; c.experiments.set(id, this.#install(c, plan));
       }
+    }
+    if (this.#commissioning && this.#current(c)) {
+      quiet(() => this.#commissioning!.discovery(result, approval, c.production?.plan.routes.length ?? 0,
+        this.#policy, () => this.#current(c)));
     }
     // All slots/bindings are installed before any lifecycle can emit ready and buffered messages.
     for (const slot of this.#slots(c)) {

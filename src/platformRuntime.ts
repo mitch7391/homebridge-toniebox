@@ -1,3 +1,4 @@
+import { COMMISSIONING_BUILD } from './toniebox/commissioning.js';
 import { performance } from 'node:perf_hooks';
 import { createAccountCoordinator } from './toniebox/accountCoordinator.js';
 import type { AuthCredentials } from './toniebox/authTypes.js';
@@ -156,11 +157,27 @@ export class PlatformRuntime {
       if (this.#stopped) {
         return;
       }
-      const coordinator = (this.#options.coordinatorFactory ?? (onStatus => createAccountCoordinator({ onStatus })))(s => this.#status(s));
+      const coordinator = (this.#options.coordinatorFactory ?? (onStatus => createAccountCoordinator({ onStatus,
+        ...(COMMISSIONING_BUILD ? { onCommissioning: event => {
+          if (!this.#stopped) {
+            try {
+              void Promise.resolve(this.#log.info('Toniebox commissioning ' + JSON.stringify(event))).catch(() => undefined);
+            } catch { /* Passive diagnostics cannot affect ownership. */ }
+          }
+        } } : {}),
+      })))(s => this.#status(s));
       if (this.#stopped) {
         quietly(() => coordinator.stop()); return;
       }
       this.#coordinator = coordinator;
+      if (COMMISSIONING_BUILD) {
+        try {
+          void Promise.resolve(this.#log.info('Toniebox commissioning diagnostics active; bounded output.')).catch(() => undefined);
+        } catch { /* No operational consequence. */ }
+      }
+      if (this.#stopped) {
+        return;
+      }
       const credentials = this.#credentials; this.#credentials = undefined;
       const supplied = coordinator.setCredentials(credentials);
       if (this.#stopped) {

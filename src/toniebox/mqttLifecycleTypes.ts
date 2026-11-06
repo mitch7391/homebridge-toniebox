@@ -6,6 +6,8 @@ export interface MqttLifecycleFailure {
     | 'generation-exhausted' | 'invalidated' | 'stopped';
   /** Allowlisted category only; no token, account, exception or server metadata. */
   readonly tokenFailure?: TokenManagerFailureKind;
+  readonly origin?: 'disconnect' | 'error';
+  readonly reasonCode?: 134 | 135;
 }
 export interface MqttLifecycleStatus {
   readonly phase: 'idle' | 'acquiring-token' | 'connecting' | 'ready' | 'waiting-retry' | 'attention-required' | 'stopped';
@@ -15,10 +17,12 @@ export interface MqttLifecycleStatus {
   readonly error?: MqttLifecycleFailure;
   /** Scheduled delay, not a continuously updating countdown. */
   readonly retryAfterMs?: number;
+  /** Safe cause of this replacement attempt; no credential revision is exposed. */
+  readonly replacement?: 'proactive' | 'recovery';
 }
 export interface MqttSessionMessage extends MqttMessage { readonly session: number }
 export interface MqttLifecycleOptions {
-  readonly tokenProvider: Pick<TokenManager, 'getAccessToken'>;
+  readonly tokenProvider: Pick<TokenManager, 'getAccessToken' | 'getStatus' | 'observeCredentials'>;
   readonly accountUuid: string;
   /** Coordinator-approved authority, copied at construction. Never inferred from discovery. */
   readonly routes: readonly MqttRoute[];

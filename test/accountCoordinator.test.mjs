@@ -558,3 +558,303 @@ for (const delay of [NaN, Infinity, -1, 10000000000]) {
     assert.equal(result.recovery.minimumRetryDelayMs, delay === 10000000000 ? delay : 60000);
   });
 }
+
+// Commissioning observers never receive private fixtures or authority objects.
+test('commissioning disabled by default and opt-in preserves operational results', async () => {
+  const events = [];
+  const a = fixture(), b = fixture({ options: { onCommissioning: e => events.push(e) } });
+  assert.deepEqual(await a.begin(), await b.begin()); a.message(); b.message(); await drain();
+  assert.deepEqual(a.calls, b.calls); assert.deepEqual(a.c.getStatus(), b.c.getStatus());
+  assert.deepEqual(a.c.getDevice('SYNTHETIC_A'), b.c.getDevice('SYNTHETIC_A'));
+  assert.equal(a.lifecycles.length, b.lifecycles.length);
+  assert.equal(events.find(e => e.kind === 'discovery').tb2Candidates, 1);
+  assert.doesNotMatch(JSON.stringify(events), /SYNTHETIC|external|password|accessToken|refreshToken/);
+});
+test('commissioning counts receipt, rejection, unchanged application and retained/live separately', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } }); await f.begin();
+  f.message(); f.message();
+  const send = (payload, retained = false, topic = 'volume/state') => f.lifecycles[0].options.onMessage({
+    routeId: 'SYNTHETIC_A', topic: 'external/toniebox/SYNTHETIC_A_MAC/' + topic,
+    payload: new TextEncoder().encode(payload), session: 1, retained, duplicate: false, qos: 1, receivedAtMs: 1000,
+  });
+  send('{"level":5}'); send('not-json'); send('{}', false, 'unknown-private-topic'); await drain();
+  const e = events.filter(e => e.kind === 'messages').at(-1);
+  assert.equal(e.received, 5); assert.equal(e.accepted, 3); assert.equal(e.rejected, 2);
+  assert.equal(e.unchanged, 1); assert.equal(e.changed, 2); assert.equal(e.retained, 2); assert.equal(e.live, 3);
+  assert.equal(e.coverage.volume, 4); assert.equal(e.acceptedCoverage.volume, 3);
+  assert.equal(Object.keys(e.coverage).length, 7);
+  assert.equal(events.filter(e => e.kind === 'messages')[2].evidence.volumeLevel, 5);
+  assert.doesNotMatch(JSON.stringify(events), /unknown-private-topic|not-json|SYNTHETIC/);
+});
+for (const mode of ['fallback', 'partial', 'unsupported', 'empty']) {
+  test('commissioning discovery authority accurately reports ' + mode, async () => {
+    const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } });
+    if (mode === 'fallback') {
+      f.account.identitySource = 'id';
+    }
+    if (mode === 'partial') {
+      f.boxesResult = { ...ok(f.boxes), diagnostics: { ...diagnostics, continuationDetected: true } };
+    }
+    if (mode === 'unsupported') {
+      f.boxes = [box('SYNTHETIC_A', { product: 'unknown' })];
+    }
+    if (mode === 'empty') {
+      f.boxes = [];
+    }
+    await f.begin(); await drain(); const e = events.find(e => e.kind === 'discovery');
+    assert.equal(e.productionRoutes, 0); assert.equal(f.lifecycles.length, 0);
+    assert.equal(e.provenance, mode === 'fallback' ? 'unverified' : 'uuid');
+    assert.equal(e.coverage, mode === 'partial' ? 'partial' : 'complete');
+    assert.equal(e.households, 1); assert.equal(e.devices, mode === 'empty' ? 0 : 1);
+    assert.equal(e.tb2Candidates, ['empty','unsupported'].includes(mode) ? 0 : 1);
+    if (mode === 'unsupported') {
+      assert.equal(e.exclusions['compatibility-unknown'], 1);
+    }
+  });
+}
+for (const action of ['stop', 'invalidate', 'clear']) {
+  test('commissioning queued and late observations cannot outlive ' + action, async () => {
+    const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } });
+    await f.begin(); await drain(); const old = f.lifecycles[0]; const before = events.length;
+    f.message(); f.c[action](); f.message(old); await drain(); assert.equal(events.length, before);
+  });
+}
+test('commissioning stale sessions and repeated readiness are ignored', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } }); await f.begin(); await drain();
+  const l = f.lifecycles[0]; l.options.onStatus({ phase:'ready', connected:true, session:1 });
+  l.options.onStatus({ phase:'waiting-retry', connected:false });
+  l.options.onStatus({ phase:'ready', connected:true, session:2 }); await drain();
+  const n = events.length; f.message(l); await drain(); assert.equal(events.length, n);
+  assert.equal(events.filter(e => e.kind === 'session').length, 2);
+});
+for (const observer of [() => {
+  throw new Error('SYNTHETIC');
+}, () => Promise.reject(new Error('SYNTHETIC'))]) {
+  test('commissioning observer failure does not affect state or cleanup', async () => {
+    const f = fixture({ options: { onCommissioning: observer } }); await f.begin(); f.message(); await drain();
+    assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+    f.c.stop(); assert.equal(f.jobs.size, 0);
+  });
+}
+test('commissioning output is detached and bounded under many messages and rediscoveries', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => {
+    events.push(globalThis.structuredClone(e)); e.kind = 'mutated';
+  } } });
+  await f.begin(); for (let i = 0; i < 70000; i++) {
+    f.message();
+  } await drain();
+  assert.ok(events.length < 30);
+  for (let i = 0; i < 80; i++) {
+    await f.c.discover();
+  }
+  await drain(); assert.ok(events.length <= 64);
+  assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+  assert.equal(f.lifecycles.length, 1);
+});
+test('commissioning all seven categories use existing parser outcomes without payload disclosure', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } }); await f.begin();
+  const values = [['metrics/battery',{ percent:50 }],['online-state',{ onlineState:'connected' }],
+    ['metrics/headphones',{ connected:[] }],['settings-applied',{ settingsApplied:false }],
+    ['playback/state',{ tonie:'SYNTHETIC_CONTENT', paused:false }],['volume/state',{ level:4 }],
+    ['app-reply/bedtime-state',{ stl:{ state:'off' } }]];
+  for (const [topic, value] of values) {
+    f.lifecycles[0].options.onMessage({ routeId:'SYNTHETIC_A',
+      topic:'external/toniebox/SYNTHETIC_A_MAC/'+topic, payload:new TextEncoder().encode(JSON.stringify(value)),
+      session:1,retained:true,duplicate:false,qos:1,receivedAtMs:1000 });
+  }
+  await drain(); const e=events.filter(e=>e.kind==='messages').at(-1);
+  assert.deepEqual(Object.values(e.acceptedCoverage),Array(7).fill(1));
+  assert.equal(f.c.getDevice('SYNTHETIC_A').playback,'unknown');
+  assert.doesNotMatch(JSON.stringify(events),/SYNTHETIC|playing/);
+});
+
+test('commissioning lane counters are independent and account reset does not replenish output budget', async () => {
+  const events = [];
+  const policy = { rules: [{ product:'EXPERIMENT', generation:'GEN', family:'unknown', decision:'experimental',
+    protocol:'ici-seven-state-topics', evidence:'synthetic' }] };
+  const f = fixture({ options: { policy, onCommissioning: e => events.push(e) } });
+  f.boxes = [box(), box('EXP', { product:'EXPERIMENT', generation:'GEN' })];
+  await f.begin(); f.message();
+  f.lifecycles[1].options.onMessage({ routeId:'EXP', topic:'external/toniebox/EXP_MAC/volume/state',
+    payload:new TextEncoder().encode('{"level":3}'), session:1, retained:false, duplicate:false, qos:1, receivedAtMs:1000 });
+  await drain();
+  const messages = events.filter(e => e.kind === 'messages');
+  assert.deepEqual(messages.map(e => [e.lane,e.received]), [['production',1],['experimental',1]]);
+  const old = f.lifecycles[0];
+  f.message(); f.c.clear(); await f.begin(); f.message(old); f.message(f.lifecycles[2]); await drain();
+  assert.equal(events.filter(e=>e.kind==='messages').at(-1).received,1);
+  // Invalidated queued observations consume budget without delivery. Exhaust the
+  // lifetime budget across resets rather than assuming all 64 slots are delivered.
+  for (let i=0; i<100; i++) {
+    f.c.clear(); await f.begin(); await drain();
+  }
+  const exhausted = events.length;
+  assert.ok(exhausted > messages.length && exhausted <= 64);
+  for (let i=0; i<10; i++) {
+    f.c.clear(); await f.begin(); await drain();
+  }
+  assert.equal(events.length, exhausted);
+});
+test('commissioning failed discovery reports unknown coverage without speculative counts', async () => {
+  const events=[]; const f=fixture({ options:{ onCommissioning:e=>events.push(e) } });
+  f.accountResult={ ok:false,error:{ kind:'invalid-response' } }; await f.begin(); await drain();
+  const e=events.find(e=>e.kind==='discovery');
+  assert.equal(e.coverage,'unknown'); assert.equal(e.provenance,'unverified');
+  assert.equal(e.devices,0); assert.equal(e.productionRoutes,0); assert.equal(e.tb2Candidates,0);
+});
+test('commissioning deferred observer reentrancy cannot restore stopped authority', async () => {
+  let f; const events=[];
+  f=fixture({ options:{ onCommissioning:e=>{
+    events.push(e); f.c.stop();
+  } } });
+  await f.begin(); await drain(); assert.equal(events.length,1);
+  assert.equal(f.c.getStatus().phase,'stopped'); assert.equal(f.jobs.size,0);
+  for (const l of f.lifecycles) {
+    f.message(l);
+  }
+  await drain(); assert.equal(events.length,1);
+});
+
+test('commissioning session establishments count independently per lane and reset with account context', async () => {
+  const events = [];
+  const policy = { rules: [{ product:'EXPERIMENT', generation:'GEN', family:'unknown', decision:'experimental',
+    protocol:'ici-seven-state-topics', evidence:'synthetic' }] };
+  const f = fixture({ options: { policy, onCommissioning: e => events.push(e) } });
+  f.boxes = [box(), box('EXP', { product:'EXPERIMENT', generation:'GEN' })];
+  await f.begin(); await drain();
+  const sessions = () => events.filter(e => e.kind === 'session').map(e => [e.lane, e.established]);
+  assert.deepEqual(sessions(), [['production',1],['experimental',1]]);
+  const reconnect = (l, session) => {
+    l.options.onStatus({ phase:'waiting-retry', connected:false });
+    l.options.onStatus({ phase:'ready', connected:true, session });
+  };
+  reconnect(f.lifecycles[1], 2); await drain();
+  reconnect(f.lifecycles[0], 2); await drain();
+  assert.deepEqual(sessions(), [['production',1],['experimental',1],['experimental',2],['production',2]]);
+  reconnect(f.lifecycles[0], 3); reconnect(f.lifecycles[1], 3);
+  f.c.clear(); f.advance(30000); await f.begin(); await drain();
+  assert.deepEqual(sessions().slice(-2), [['production',1],['experimental',1]]);
+  assert.equal(sessions().length, 6); // Queued old-context establishments never escape.
+  for (let i=0; i<100; i++) {
+    f.c.clear(); await f.begin(); await drain();
+  }
+  const exhausted = events.length; assert.ok(exhausted <= 64);
+  f.c.clear(); await f.begin(); await drain(); assert.equal(events.length, exhausted);
+});
+
+for (const phase of ['waiting-retry', 'attention-required']) {
+  test('commissioning post-ready lifecycle observation: ' + phase, async () => {
+    const events=[]; const f=fixture({ options:{ onCommissioning:e=>events.push(e) } }); await f.begin(); await drain();
+    const status={ phase, connected:false, error:{ kind:'transport', tokenFailure:'backoff', private:'SYNTHETIC_SECRET' } };
+    for(let i=0;i<100;i++) {
+      f.lifecycles[0].options.onStatus(status);
+    }
+    await drain(); const observed=events.filter(e=>e.kind==='lifecycle');
+    assert.deepEqual(observed,[{ kind:'lifecycle',lane:'production',previouslyReady:true,phase,failure:'transport' }]);
+    assert.equal(f.c.getStatus().connections[0].status.phase,phase);
+    assert.doesNotMatch(JSON.stringify(events),/SYNTHETIC|private/);
+  });
+}
+for (const error of [{ kind:'token',tokenFailure:'authentication-failed' }, { kind:'token',tokenFailure:'PRIVATE' },
+  { kind:'PRIVATE',tokenFailure:'backoff' }, undefined]) {
+  test('commissioning initial failure uses only existing sanitised categories ' + JSON.stringify(error), async () => {
+    const events=[];
+    const f=fixture({ options:{ onCommissioning:e=>events.push(e), lifecycleFactory:o=>({
+      getStatus:()=>({ phase:'idle',connected:false }),stop(){},start(){
+        o.onStatus({ phase:'attention-required',connected:false,error });
+      },
+    }) } });
+    await f.begin(); await drain(); const event=events.find(e=>e.kind==='lifecycle');
+    assert.equal(event.previouslyReady,false); assert.equal(event.phase,'attention-required');
+    assert.equal(event.failure,error?.kind==='token'?'token':undefined);
+    assert.equal(event.tokenFailure,error?.tokenFailure==='authentication-failed'?'authentication-failed':undefined);
+    assert.doesNotMatch(JSON.stringify(events),/PRIVATE|SYNTHETIC/);
+  });
+}
+test('commissioning lifecycle lanes stay separate and obsolete transitions never publish', async () => {
+  const events=[]; const policy={ rules:[{ product:'EXPERIMENT',generation:'GEN',family:'unknown',decision:'experimental',
+    protocol:'ici-seven-state-topics',evidence:'synthetic' }] };
+  const f=fixture({ options:{ policy,onCommissioning:e=>events.push(e) } });
+  f.boxes=[box(),box('EXP',{ product:'EXPERIMENT',generation:'GEN' })]; await f.begin(); await drain();
+  const failure={ phase:'attention-required',connected:false,error:{ kind:'authentication-refused' } };
+  f.lifecycles[1].options.onStatus(failure); await drain();
+  assert.equal(events.find(e=>e.kind==='lifecycle').lane,'experimental');
+  assert.equal(f.c.getStatus().connections.find(c=>c.lane==='production').status.phase,'ready');
+  const n=events.length; f.lifecycles[0].options.onStatus(failure); f.c.clear(); await drain();
+  f.lifecycles[0].options.onStatus(failure); await drain(); assert.equal(events.length,n);
+});
+test('commissioning lifecycle budget, supersession and observer exceptions are contained', async () => {
+  let attempts=0;const f=fixture({ options:{ onCommissioning:()=>{
+    attempts++;throw Error('SYNTHETIC');
+  } } });
+  await f.begin();await drain();const l=f.lifecycles[0];const n=attempts;
+  l.options.onStatus({ phase:'waiting-retry',connected:false,error:{ kind:'transport' } });
+  l.options.onStatus({ phase:'ready',connected:true,session:2 });await drain();assert.equal(attempts,n+1);
+  for(let i=0;i<100;i++) {
+    l.options.onStatus({ phase:'waiting-retry',connected:false,error:{ kind:i%2?'transport':'timeout' } });await drain();
+  }
+  assert.ok(attempts<=64);assert.equal(f.c.getStatus().connections[0].status.phase,'waiting-retry');
+  f.c.stop();const stopped=attempts;l.options.onStatus({ phase:'attention-required',connected:false });await drain();
+  assert.equal(attempts,stopped);assert.equal(f.jobs.size,0);
+});
+
+
+test('shared real token manager renews production and experimental slots without discovery or rebinding', async () => {
+  const events = [], transports = [], slots = []; let serial = 0, logins = 0, refreshes = 0;
+  const grant = () => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_' + (++serial), refreshToken: 'SYNTHETIC_REFRESH_' + serial,
+    tokenType: 'Bearer', expiresInSeconds: 300 } });
+  let f;
+  f = fixture({ options: { policy: experimentalPolicy, onCommissioning: e => events.push(e), authClient: {
+    login: async () => {
+      logins++; return grant();
+    }, refresh: async () => {
+      refreshes++; return grant();
+    },
+  }, lifecycleFactory: options => {
+    slots.push(options);
+    return createMqttLifecycle({ ...options, jitter: () => 0.5, transportFactory: callbacks => {
+      const t = { callbacks, closed: false, getStatus: () => ({ phase: 'idle' }), close() {
+        this.closed = true;
+      },
+      async connect(auth, routes) {
+        this.auth = auth; this.routes = routes;
+        assert.ok(transports.filter(p => p !== this && p.routes?.[0].routeId === routes[0].routeId).every(p => p.closed));
+        callbacks.onStatus({ phase: 'ready' });
+        callbacks.onMessage({ routeId: routes[0].routeId, topic: 'external/toniebox/' + routes[0].macAddress + '/volume/state',
+          payload: new TextEncoder().encode('{"level":7}'), retained: true, duplicate: false, qos: 1, receivedAtMs: serial * 1000 });
+        return { ok: true };
+      } };
+      transports.push(t); return t;
+    } });
+  } } });
+  f.boxes = [box(), ...experiments(1)]; await f.begin(); await drain();
+  for (let n = 2; n <= 4; n++) {
+    const old = transports.slice(); const renewal = [...f.jobs].find(j => j.ms === 240000); assert.ok(renewal);
+    f.advance(240000); f.jobs.delete(renewal); renewal.fn(); await drain();
+    assert.equal(slots.length, 2); assert.equal(transports.length, n * 2);
+    const device = f.c.getDevice('SYNTHETIC_A');
+    assert.equal(device.state.topics['volume/state'].session, n); assert.equal(device.freshness['volume/state'], 'retained');
+    old[0].callbacks.onMessage({ routeId: 'SYNTHETIC_A', topic: 'external/toniebox/SYNTHETIC_A_MAC/volume/state',
+      payload: new TextEncoder().encode('{"level":99}'), retained: false, duplicate: false, qos: 1, receivedAtMs: 999999 });
+    assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 7);
+  }
+  assert.equal(logins, 1); assert.equal(refreshes, 3); assert.deepEqual(f.calls, ['account', 'households', 'boxes']);
+  assert.equal(events.filter(e => e.kind === 'renewal' && e.grant === 'refresh' && e.outcome === 'success').length, 3);
+  assert.equal(events.filter(e => e.kind === 'replacement' && e.phase === 'ready').length, 6);
+  assert.doesNotMatch(JSON.stringify([f.c.getStatus(), events]), /SYNTHETIC|accessToken|refreshToken|revision/);
+  f.c.stop(); assert.ok(transports.every(t => t.closed)); assert.equal(f.jobs.size, 0);
+});
+
+test('commissioning refusal metadata is narrowly projected and stale transitions remain suppressed', async () => {
+  const events = []; const f = fixture({ options: { onCommissioning: e => events.push(e) } }); await f.begin();
+  const l = f.lifecycles[0];
+  l.options.onStatus({ phase: 'waiting-retry', connected: false, error: {
+    kind: 'authentication-refused', origin: 'disconnect', reasonCode: 135, message: 'SYNTHETIC_SECRET', packet: { private: true },
+  } }); await drain();
+  const event = events.filter(e => e.kind === 'lifecycle').at(-1);
+  assert.equal(event.origin, 'disconnect'); assert.equal(event.reasonCode, 135);
+  assert.doesNotMatch(JSON.stringify(events), /SYNTHETIC|packet|message/);
+  const before = events.length;
+  l.options.onStatus({ phase: 'connecting', connected: false, replacement: 'proactive' });
+  f.c.stop(); await drain(); assert.equal(events.length, before);
+});

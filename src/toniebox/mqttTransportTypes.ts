@@ -16,6 +16,8 @@ export interface MqttFailure {
   readonly kind: 'invalid-input' | 'closed' | 'cancelled' | 'timeout' | 'transport' | 'protocol'
     | 'subscription-refused' | 'authentication-refused' | 'resource-limit' | 'unsafe-tracing' | 'dependency';
   readonly reasonCode?: number;
+  /** Authentication refusal provenance only; never inferred from a generic error code. */
+  readonly origin?: 'disconnect' | 'error';
 }
 export type MqttResult = { readonly ok: true } | { readonly ok: false; readonly error: MqttFailure };
 export type MqttStatus = {
