@@ -275,6 +275,26 @@ Commissioning diagnostics remain disabled in committed source, and the plugin st
 
 This completes Increment 7A, establishing a live-validated backend foundation for future HomeKit accessory development.
 
+### ✅ Increment 8A - HomeKit Presentation Research (Complete)
+
+The first stage of HomeKit accessory development is now complete.
+
+Nine isolated synthetic scenarios were developed to investigate how Toniebox functionality could be represented in Apple Home, including speaker presentation, playback control, volume adjustment and battery reporting.
+
+Manual testing with Apple Home, Siri and Eve revealed an important distinction between HomeKit's supported characteristics and the controls Apple's Home app actually exposes. For example, an externally published SmartSpeaker provides a recognisable speaker identity and playback status, but Apple's Home app does not expose usable direct native playback or volume controls. Native playback and volume commands can nevertheless be issued through supported HomeKit scene actions, while a dedicated Playback Switch offers practical direct Play/Pause control in Apple Home and through Siri.
+
+The research established the initial presentation direction:
+
+- **SmartSpeaker:** Speaker identity, playback feedback and native playback and volume scene actions.
+- **Playback Switch:** Direct Play/Pause control through Apple Home and Siri.
+- **Linked Battery:** Battery level and charging telemetry using genuine device state.
+
+A separate Lightbulb-based volume slider remains a possible future enhancement, **opt-in and disabled by default**, for users who want direct volume adjustment in Apple Home. The regular Speaker and combined Speaker/SmartSpeaker approaches were not selected because their added controls were not usable in Apple's Home app.
+
+The isolated presentation fixture passed **122 automated offline tests**. Findings from the nine scenarios and their limitations are documented in the [HomeKit Presentation Research](experiments/homekit-presentation/FINDINGS.md), separately from the synthetic [fixture and test procedures](experiments/homekit-presentation/README.md).
+
+This completes the presentation research stage, not production HomeKit integration. The plugin still does not create live Toniebox accessories or expose physical-device controls. The next stage is to establish safe integration boundaries with the existing backend before implementing accessories.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -297,7 +317,8 @@ Here's the current plan for development:
 - [x] **Increment 7A:** Live backend commissioning and MQTT reliability
   - [x] **7A.1:** Opt-in commissioning diagnostics
   - [x] **7A.2:** MQTT credential renewal and recovery
-- [ ] **Future:** HomeKit accessories and controls
+- [x] **Increment 8A:** HomeKit presentation research
+- [ ] **Increment 8B:** Production HomeKit architecture discovery and accessory integration
 - [ ] **Future:** Beta testing and refinement
 
 The roadmap is subject to change as development progresses.
@@ -368,6 +389,8 @@ The results have been documented in the [Toniebox Proof of Concept Handover](doc
 This provides the technical foundation for future development and helps avoid repeating experiments that have already been completed.
 
 The [Discovery API Evidence](docs/discovery-api-evidence.md) also records the observed REST discovery behaviour, implementation decisions and remaining API uncertainties.
+
+The [HomeKit Presentation Research](experiments/homekit-presentation/FINDINGS.md) records the synthetic A–I accessory experiments, Apple Home/Siri/Eve observations and the initial presentation design chosen ahead of production integration.
 
 Initial development is focused on **Toniebox 2**. Compatibility with other generations will require additional verification.
 
