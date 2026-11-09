@@ -289,7 +289,7 @@ The research established the initial presentation direction:
 - **Playback Switch:** Direct Play/Pause control through Apple Home and Siri.
 - **Linked Battery:** Battery level and charging telemetry using genuine device state.
 
-A separate Lightbulb-based volume slider remains a possible future enhancement, **opt-in and disabled by default**, for users who want direct volume adjustment in Apple Home. The regular Speaker and combined Speaker/SmartSpeaker approaches were not selected because their added controls were not usable in Apple's Home app.
+A separate Lightbulb-based volume slider remains a possible future enhancement, **opt-in and disabled by default**, for users who want direct volume adjustment in Apple Home. The regular Speaker was not selected because Apple Home did not expose its volume controls. A combined Speaker/SmartSpeaker arrangement was considered but not tested, as its expected benefit would require a third-party HomeKit app and introduce additional complexity.
 
 The isolated presentation fixture passed **122 automated offline tests**. Findings from the nine scenarios and their limitations are documented in the [HomeKit Presentation Research](experiments/homekit-presentation/FINDINGS.md), separately from the synthetic [fixture and test procedures](experiments/homekit-presentation/README.md).
 
