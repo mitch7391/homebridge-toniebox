@@ -1,0 +1,27 @@
+{
+  "bridge": {
+    "name": "Synthetic Toniebox B",
+    "username": "02:8A:10:00:00:02",
+    "port": 53182,
+    "pin": "583-24-916"
+  },
+  "plugins": [
+    "homebridge-toniebox-presentation-fixture"
+  ],
+  "accessories": [],
+  "platforms": [
+    {
+      "platform": "TonieboxPresentationFixture",
+      "name": "Synthetic Toniebox B",
+      "fixtureOnly": true,
+      "scenario": "B",
+      "playback": "paused",
+      "battery": "discharging",
+      "unavailable": false
+    }
+  ],
+  "ports": {
+    "start": 53282,
+    "end": 53282
+  }
+}
