@@ -293,7 +293,19 @@ A separate Lightbulb-based volume slider remains a possible future enhancement, 
 
 The isolated presentation fixture passed **122 automated offline tests**. Findings from the nine scenarios and their limitations are documented in the [HomeKit Presentation Research](experiments/homekit-presentation/FINDINGS.md), separately from the synthetic [fixture and test procedures](experiments/homekit-presentation/README.md).
 
-This completes the presentation research stage, not production HomeKit integration. The plugin still does not create live Toniebox accessories or expose physical-device controls. The next stage is to establish safe integration boundaries with the existing backend before implementing accessories.
+This completes the presentation research stage, not production HomeKit integration. The plugin still does not create live Toniebox accessories or expose physical-device controls. Increment 8B.1 has since established the initial backend-to-HomeKit integration contract; accessory publication remains future work.
+
+### ✅ Increment 8B.1 - Production HomeKit Integration Contract (Complete)
+
+The first stage of production HomeKit integration is now complete.
+
+The account coordinator now provides a read-only inventory of authorised production Tonieboxes and event-driven notifications for device, routing and connection-state changes.
+
+The integration preserves existing account and MQTT session authority, distinguishes current from last-known routing information, and prevents stale or revoked connections from supplying authoritative updates. Experimental devices remain isolated from production HomeKit presentation.
+
+Increment 8B.1 passed **1,181 automated offline tests**, including **31 new regression tests**. Validation also passed across the supported Node.js 22 and 24 runtimes.
+
+This establishes the interface required for future HomeKit accessories. The plugin does not yet publish production accessories or provide physical-device controls.
 
 ## Roadmap
 
@@ -319,6 +331,8 @@ Here's the current plan for development:
   - [x] **7A.2:** MQTT credential renewal and recovery
 - [x] **Increment 8A:** HomeKit presentation research
 - [ ] **Increment 8B:** Production HomeKit architecture discovery and accessory integration
+  - [x] **8B.1:** Production device inventory and change notifications
+  - [ ] **8B.2:** External SmartSpeaker lifecycle and read-only presentation
 - [ ] **Future:** Beta testing and refinement
 
 The roadmap is subject to change as development progresses.
