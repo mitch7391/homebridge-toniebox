@@ -858,3 +858,276 @@ test('commissioning refusal metadata is narrowly projected and stale transitions
   l.options.onStatus({ phase: 'connecting', connected: false, replacement: 'proactive' });
   f.c.stop(); await drain(); assert.equal(events.length, before);
 });
+
+// Production presentation contract: private inventory, identifier-free refresh hints.
+function productionFixture(options = {}) {
+  const changes = [];
+  const f = fixture({ options: { ...options, onProductionChange: event => changes.push(event) } });
+  return Object.assign(f, { changes });
+}
+function productionMessage(f, patch = {}, lifecycle = f.lifecycles[0]) {
+  lifecycle.options.onMessage({ routeId: 'SYNTHETIC_A', topic: 'external/toniebox/SYNTHETIC_A_MAC/volume/state',
+    payload: new TextEncoder().encode('{"level":4}'), receivedAtMs: 1000, session: 1, retained: true, duplicate: false, qos: 1, ...patch });
+}
+
+test('production contract: inert empty inventory and no construction notifications', async () => {
+  const f = productionFixture(); await drain();
+  assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+  f.c.setCredentials(credentials); await drain();
+  assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+  assert.deepEqual(f.changes, []); assert.deepEqual(f.calls, []); assert.equal(f.jobs.size, 0);
+});
+
+test('production contract: detached frozen inventory uses approved identity and optional name only', async () => {
+  const f = productionFixture(); f.boxes = [box(undefined, { name: 'SYNTHETIC_NAME' })]; await f.begin(); await drain();
+  const inventory = f.c.getProductionInventory();
+  assert.deepEqual(inventory, { authority: 'current', accountUuid: 'SYNTHETIC_ACCOUNT', identitySource: 'uuid',
+    devices: [{ routeId: 'SYNTHETIC_A', macAddress: 'SYNTHETIC_A_MAC', displayName: 'SYNTHETIC_NAME' }] });
+  assert.ok(Object.isFrozen(inventory)); assert.ok(Object.isFrozen(inventory.devices)); assert.ok(Object.isFrozen(inventory.devices[0]));
+  assert.throws(() => {
+    inventory.devices[0].routeId = 'OTHER';
+  }, TypeError);
+  const second = f.c.getProductionInventory(); assert.notEqual(second, inventory); assert.notEqual(second.devices[0], inventory.devices[0]);
+  f.boxes[0].name = 'MUTATED'; assert.equal(f.c.getProductionInventory().devices[0].displayName, 'SYNTHETIC_NAME');
+  assert.ok(f.changes.some(e => e.reasons.includes('inventory')));
+});
+
+test('production contract: multiple routes share account authority and exclude experimental inventory and events', async () => {
+  const f = productionFixture({ policy: experimentalPolicy }); f.boxes = [box(), box('SYNTHETIC_B'), ...experiments(1)];
+  await f.begin(); await drain();
+  assert.deepEqual(f.c.getProductionInventory().devices.map(d => d.routeId), ['SYNTHETIC_A', 'SYNTHETIC_B']);
+  const before = f.changes.length; const experimental = f.lifecycles[1];
+  productionMessage(f, { routeId: 'EXP_0', topic: 'external/toniebox/EXP_0_MAC/volume/state' }, experimental);
+  assert.equal(f.c.getDevice('EXP_0', 'experimental').state.topics['volume/state'].value.level, 4);
+  experimental.options.onStatus({ phase: 'waiting-retry', connected: false }); await drain();
+  assert.equal(f.changes.length, before); assert.equal(f.c.getProductionInventory().devices.length, 2);
+});
+
+test('production contract: an experimental-only account exposes no production inventory', async () => {
+  const f = productionFixture({ policy: experimentalPolicy }); f.boxes = experiments(1); await f.begin(); await drain();
+  assert.equal(f.lifecycles.length, 1); assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+  assert.deepEqual(f.changes, []);
+});
+
+for (const mode of ['partial', 'fallback', 'unsupported']) {
+  test('production contract: initial ' + mode + ' evidence cannot authorise inventory', async () => {
+    const f = productionFixture();
+    if (mode === 'partial') {
+      f.boxesResult = { ...ok([box()]), diagnostics: { ...diagnostics, rejectedEntries: 1 } };
+    } else if (mode === 'fallback') {
+      f.account.identitySource = 'id';
+    } else {
+      f.boxes = [box(undefined, { features: [] })];
+    }
+    await f.begin(); await drain();
+    assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] }); assert.equal(f.lifecycles.length, 0);
+  });
+}
+
+test('production contract: partial rediscovery retains prior authority without speculative additions or restarts', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); const prior = f.c.getProductionInventory();
+  f.boxesResult = { ...ok([box('NEW')]), diagnostics: { ...diagnostics, rejectedEntries: 1 } };
+  await f.c.discover(); await drain(); const retained = f.c.getProductionInventory();
+  assert.equal(retained.authority, 'last-known'); assert.deepEqual(retained.devices, prior.devices);
+  assert.equal(retained.accountUuid, prior.accountUuid); assert.equal(f.lifecycles.length, 1); assert.equal(f.lifecycles[0].stops, 0);
+  assert.ok(f.changes.at(-1).reasons.includes('inventory'));
+  const count = f.changes.length; await f.c.discover(); await drain(); assert.equal(f.changes.length, count);
+});
+
+test('production contract: unchanged rediscovery is silent and definitive removal withdraws inventory', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); const count = f.changes.length;
+  await f.c.discover(); await drain(); assert.equal(f.changes.length, count);
+  f.boxes = []; await f.c.discover(); await drain();
+  assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+  assert.deepEqual(f.changes.at(-1).reasons, ['inventory']); assert.equal(f.lifecycles[0].stops, 1);
+  productionMessage(f); await drain(); assert.equal(f.changes.length, count + 1);
+});
+
+test('production contract: changed and unchanged accepted messages both refresh committed backend observations', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0;
+  productionMessage(f); assert.equal(f.changes.length, 0); await drain();
+  assert.deepEqual(f.changes, [{ reasons: ['observation'] }]);
+  const first = f.c.getDevice('SYNTHETIC_A');
+  productionMessage(f, { receivedAtMs: 2000, duplicate: true }); await drain();
+  assert.equal(f.changes.length, 2); const second = f.c.getDevice('SYNTHETIC_A');
+  assert.deepEqual(second.state.topics['volume/state'].value, first.state.topics['volume/state'].value);
+  assert.equal(second.state.topics['volume/state'].receivedAtMs, 2000);
+  productionMessage(f, { retained: false, receivedAtMs: 3000 }); await drain();
+  assert.equal(f.changes.length, 3); assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['volume/state'], 'observed');
+  assert.equal(first.freshness['volume/state'], 'retained');
+});
+
+test('production contract: disconnection and new session refresh freshness without losing last-known values', async () => {
+  const f = productionFixture(); await f.begin(); productionMessage(f); await drain(); f.changes.length = 0;
+  const l = f.lifecycles[0]; l.options.onStatus({ phase: 'waiting-retry', connected: false }); await drain();
+  assert.deepEqual(f.changes, [{ reasons: ['transport'] }]);
+  assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['volume/state'], 'last-known');
+  l.options.onStatus({ phase: 'ready', connected: true, session: 2 }); await drain();
+  assert.equal(f.changes.length, 2); assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['volume/state'], 'last-known');
+  productionMessage(f, { session: 2, receivedAtMs: 2000 }); await drain();
+  assert.equal(f.changes.length, 3); assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['volume/state'], 'retained');
+  assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+  l.options.onStatus({ phase: 'ready', connected: true, session: 2 });
+  l.options.onStatus({ phase: 'ready', connected: true, session: 1 }); productionMessage(f); await drain();
+  assert.equal(f.changes.length, 3);
+});
+
+for (const patch of [
+  { session: 99 }, { routeId: 'UNKNOWN' }, { topic: 'external/toniebox/WRONG/volume/state' },
+  { payload: new TextEncoder().encode('invalid') }, { receivedAtMs: -1 },
+]) {
+  test('production contract: rejected message cannot notify: ' + Object.keys(patch)[0], async () => {
+    const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0;
+    productionMessage(f, patch); await drain(); assert.deepEqual(f.changes, []);
+    assert.deepEqual(f.c.getDevice('SYNTHETIC_A').state.topics, {});
+  });
+}
+
+test('production contract: queued old-session observations are suppressed and same-turn accepted messages coalesce', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0;
+  for (let i = 0; i < 100; i++) {
+    productionMessage(f, { receivedAtMs: 1000 + i });
+  }
+  await drain(); assert.deepEqual(f.changes, [{ reasons: ['observation'] }]);
+  f.changes.length = 0; productionMessage(f, { receivedAtMs: 2000 });
+  f.lifecycles[0].options.onStatus({ phase: 'waiting-retry', connected: false });
+  f.lifecycles[0].options.onStatus({ phase: 'ready', connected: true, session: 2 }); await drain();
+  assert.deepEqual(f.changes, [{ reasons: ['transport'] }]);
+});
+
+for (const action of ['clear', 'invalidate', 'stop', 'replace']) {
+  test('production contract: ' + action + ' revokes queued messages and old callbacks before notification', async () => {
+    const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0; productionMessage(f);
+    if (action === 'replace') {
+      f.c.setCredentials({ username: 'REPLACEMENT', password: 'REPLACEMENT' });
+    } else {
+      f.c[action]();
+    }
+    assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+    productionMessage(f); f.lifecycles[0].options.onStatus({ phase: 'ready', connected: true, session: 2 }); await drain();
+    assert.deepEqual(f.changes, [{ reasons: [action === 'stop' ? 'stopped' : 'revoked'] }]);
+    assert.equal(f.c.getDevice('SYNTHETIC_A'), undefined); assert.equal(f.lifecycles[0].stops, 1);
+    if (action === 'replace') {
+      f.advance(30000); f.c.start(); assert.equal((await f.c.discover()).ok, true); await drain(); const count = f.changes.length;
+      productionMessage(f, { receivedAtMs: 9000 }); await drain(); assert.equal(f.changes.length, count);
+      assert.deepEqual(f.c.getDevice('SYNTHETIC_A').state.topics, {});
+    }
+  });
+}
+
+test('production contract: reentrant observer shutdown sees committed state and is terminal', async () => {
+  const changes = []; let f;
+  f = fixture({ options: { onProductionChange: notice => {
+    changes.push(notice);
+    if (notice.reasons.includes('inventory')) {
+      assert.equal(f.c.getProductionInventory().devices.length, 1);
+      assert.equal(f.c.getStatus().phase, 'connected'); f.c.stop();
+    }
+  } } });
+  await f.begin(); await drain(); assert.equal(changes.length, 2); assert.deepEqual(changes[1].reasons, ['stopped']);
+  f.c.stop(); f.c.start(); productionMessage(f); await f.c.discover(); await drain();
+  assert.equal(changes.length, 2); assert.equal(f.jobs.size, 0); assert.equal(f.lifecycles[0].stops, 1);
+});
+
+for (const mode of ['throw', 'reject']) {
+  test('production contract: ' + mode + ' from observer is contained without changing state or lifecycle', async () => {
+    let calls = 0;
+    const f = fixture({ options: { onProductionChange: () => {
+      calls++;
+      if (mode === 'throw') {
+        throw new Error('SYNTHETIC_SECRET');
+      }
+      return Promise.reject(new Error('SYNTHETIC_SECRET'));
+    } } });
+    await f.begin(); await drain(); productionMessage(f); await drain();
+    assert.equal(calls, 2); assert.equal(f.c.getStatus().phase, 'connected'); assert.equal(f.lifecycles[0].stops, 0);
+    assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+    f.c.stop(); await drain(); assert.equal(calls, 3); assert.equal(f.jobs.size, 0);
+  });
+}
+
+test('production contract: notifications and public diagnostics remain identifier-free and detached', async () => {
+  const commissioning = []; const f = productionFixture({ onCommissioning: e => commissioning.push(e) });
+  f.boxes = [box(undefined, { name: 'SYNTHETIC_NAME' })]; await f.begin(); productionMessage(f); await drain();
+  assert.doesNotMatch(JSON.stringify([f.changes, f.notices, commissioning, f.c.getStatus()]), /SYNTHETIC|accessToken|refreshToken|macAddress/);
+  assert.ok(f.changes.every(e => Object.isFrozen(e) && Object.isFrozen(e.reasons)));
+  assert.throws(() => {
+    f.changes[0].reasons.push('private');
+  }, TypeError);
+  const device = f.c.getDevice('SYNTHETIC_A'); device.state.topics['volume/state'].value.level = 999;
+  assert.equal(f.c.getDevice('SYNTHETIC_A').state.topics['volume/state'].value.level, 4);
+});
+
+test('production contract: observing adds no grants, requests, timers, connections or route subscriptions', async () => {
+  const plain = fixture(), observed = productionFixture(); await plain.begin(); await observed.begin(); await drain();
+  assert.deepEqual(observed.calls, plain.calls); assert.equal(observed.jobs.size, plain.jobs.size);
+  assert.deepEqual(observed.lifecycles[0].options.routes, plain.lifecycles[0].options.routes);
+  const jobs = [...observed.jobs], calls = [...observed.calls];
+  for (let i = 0; i < 10; i++) {
+    productionMessage(observed, { receivedAtMs: 1000 + i }); await drain();
+    observed.c.getProductionInventory(); observed.c.getDevice('SYNTHETIC_A');
+  }
+  assert.deepEqual([...observed.jobs], jobs); assert.deepEqual(observed.calls, calls);
+  assert.equal(observed.lifecycles.length, 1); assert.equal(observed.lifecycles[0].starts, 1);
+});
+
+test('production contract: inventory exposes the routing policy normalised MAC without manufacturing a name', async () => {
+  const f = productionFixture(); f.boxes = [box(undefined, { macAddress: 'synthetic_a_mac' })]; await f.begin();
+  assert.deepEqual(f.c.getProductionInventory().devices, [{ routeId: 'SYNTHETIC_A', macAddress: 'SYNTHETIC_A_MAC' }]);
+});
+
+test('production contract: changed verified account revokes inventory while fallback cannot replace provenance', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0;
+  f.account = { id: 'UNTRUSTED_FALLBACK', identitySource: 'id' }; await f.c.discover(); await drain();
+  assert.equal(f.c.getProductionInventory().accountUuid, 'SYNTHETIC_ACCOUNT');
+  assert.equal(f.c.getProductionInventory().authority, 'last-known'); f.changes.length = 0;
+  f.account = { id: 'OTHER_VERIFIED_ACCOUNT', identitySource: 'uuid' }; await f.c.discover(); await drain();
+  assert.deepEqual(f.c.getProductionInventory(), { authority: 'none', devices: [] });
+  assert.deepEqual(f.changes, [{ reasons: ['revoked'] }]);
+});
+
+test('production contract: replacement drops old-slot observations and publishes the committed new inventory', async () => {
+  const f = productionFixture(); await f.begin(); await drain(); f.changes.length = 0;
+  const old = f.lifecycles[0]; f.boxes = [box('SYNTHETIC_B')];
+  await f.c.discover(); await drain(); assert.deepEqual(f.c.getProductionInventory().devices.map(d => d.routeId), ['SYNTHETIC_B']);
+  assert.ok(f.changes.at(-1).reasons.includes('inventory')); const count = f.changes.length;
+  productionMessage(f, {}, old); old.options.onStatus({ phase: 'ready', connected: true, session: 9 }); await drain();
+  assert.equal(f.changes.length, count); assert.equal(f.c.getDevice('SYNTHETIC_A'), undefined);
+});
+
+test('production contract: ignored retained history after live data cannot create a refresh', async () => {
+  const f = productionFixture(); await f.begin();
+  productionMessage(f, { topic: 'external/toniebox/SYNTHETIC_A_MAC/online-state',
+    payload: new TextEncoder().encode('{"onlineState":"connected"}'), retained: false });
+  await drain(); assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['online-state'], 'observed');
+  const count = f.changes.length;
+  productionMessage(f, { topic: 'external/toniebox/SYNTHETIC_A_MAC/online-state',
+    payload: new TextEncoder().encode('{"onlineState":"disconnected"}'), receivedAtMs: 2000 });
+  await drain(); assert.equal(f.changes.length, count);
+  assert.equal(f.c.getDevice('SYNTHETIC_A').freshness['online-state'], 'observed');
+});
+
+test('production contract: real lifecycle buffered first message is visible before its connect promise settles', async () => {
+  const connecting = deferred(), changes = []; let callbacks, f;
+  f = fixture({ options: {
+    onProductionChange: event => changes.push({ event, inventory: f.c.getProductionInventory(), observation: f.c.getDevice('SYNTHETIC_A') }),
+    lifecycleFactory: options => createMqttLifecycle({ ...options, jitter: () => 0.5, transportFactory: hooks => {
+      callbacks = hooks;
+      return { getStatus: () => ({ phase: 'idle' }), close() {}, connect() {
+        hooks.onStatus({ phase: 'ready' });
+        hooks.onMessage({ routeId: 'SYNTHETIC_A', topic: 'external/toniebox/SYNTHETIC_A_MAC/volume/state',
+          payload: new TextEncoder().encode('{"level":7}'), retained: true, duplicate: false, qos: 1, receivedAtMs: 1000 });
+        return connecting.promise;
+      } };
+    } }),
+  } });
+  await f.begin(); await drain();
+  const observed = changes.find(e => e.event.reasons.includes('observation'));
+  assert.ok(observed); assert.equal(observed.inventory.devices.length, 1);
+  assert.equal(observed.observation.state.topics['volume/state'].value.level, 7);
+  assert.equal(observed.observation.freshness['volume/state'], 'retained');
+  assert.equal(observed.observation.transport.session, 1);
+  f.c.stop(); await drain(); const count = changes.length;
+  connecting.resolve({ ok: true }); callbacks.onStatus({ phase: 'ready' }); await drain();
+  assert.equal(changes.length, count); assert.equal(f.jobs.size, 0);
+});

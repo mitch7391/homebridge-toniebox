@@ -27,7 +27,7 @@ export type DiscoveryRecovery = {
 export type CoordinatorResult = ({ readonly ok: true } | {
   readonly ok: false; readonly reason: CoordinatorFailure; readonly retryAfterMs?: number;
 }) & { readonly recovery?: DiscoveryRecovery };
-/** Identifier-free snapshots. Private device observations are available only through getDevice(). */
+/** Identifier-free snapshots. Private inventory and observations use separate explicit getters. */
 export interface CoordinatorStatus {
   readonly phase: CoordinatorPhase;
   readonly discovery: 'never' | 'running' | 'complete' | 'degraded';
@@ -39,7 +39,29 @@ export interface CoordinatorStatus {
   readonly reason?: CoordinatorFailure;
   readonly connections: readonly { readonly lane: 'production' | 'experimental'; readonly status: MqttLifecycleStatus }[];
 }
+/** Private integration data, never diagnostic/log data or durable routing permission.
+ * Names are last approved plan metadata, not a separately refreshed catalogue. */
+export interface ProductionDevice {
+  readonly routeId: string;
+  readonly macAddress: string;
+  readonly displayName?: string;
+}
+export type ProductionInventory =
+  | { readonly authority: 'none'; readonly devices: readonly ProductionDevice[] }
+  | { readonly authority: 'current' | 'last-known'; readonly accountUuid: string;
+      readonly identitySource: 'uuid'; readonly devices: readonly ProductionDevice[] };
+export type ProductionChangeReason = 'inventory' | 'observation' | 'transport' | 'revoked' | 'stopped';
+/** Identifier-free refresh hint, not a snapshot or event history. Read current inventory
+ * and getDevice() in the callback. Same-turn hints coalesce; obsolete context/session
+ * hints are dropped. Accepted unchanged messages still request a refresh.
+ * One final stopped hint is permitted; no subsequent notifications are delivered. */
+export interface ProductionChange {
+  readonly reasons: readonly ProductionChangeReason[];
+}
+
 export interface AccountCoordinatorOptions {
+  /** Deferred passive internal observer. Exceptions/rejections are contained; no timers or I/O. */
+  readonly onProductionChange?: (notice: ProductionChange) => void;
   /** Explicit passive opt-in; receives only bounded, identifier-free projections. */
   readonly onCommissioning?: (event: CommissioningObservation) => void;
   readonly authClient?: AuthClient;
@@ -61,6 +83,9 @@ export interface AccountCoordinator {
   /** Concurrent callers share a run; caller abort cancels only its own wait. */
   discover(options?: { readonly signal?: AbortSignal }): Promise<CoordinatorResult>;
   getStatus(): CoordinatorStatus;
+  /** Detached, frozen current production authority only. Empty after revocation; excludes experiments.
+   * last-known means existing approval retained by reconciliation, never permission inferred from state. */
+  getProductionInventory(): ProductionInventory;
   getDevice(routeId: string, lane?: 'production' | 'experimental', nowMs?: number): DeviceObservation | undefined;
   /** Revokes context before clearing tokens; both token and discovery cooldowns survive. */
   clear(): void;

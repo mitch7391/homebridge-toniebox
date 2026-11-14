@@ -16,7 +16,7 @@ import type { ApprovedRoutePlan, CompatibilityPolicy } from './routingTypes.js';
 import type { TokenClock, TokenManager } from './tokenManagerTypes.js';
 import { MAX_EXPERIMENTAL_CONNECTIONS } from './accountCoordinatorTypes.js';
 import type { AccountCoordinator, AccountCoordinatorOptions, CoordinatorFailure, CoordinatorResult, CoordinatorStatus,
-  DiscoveryRecovery, DiscoveryRecoveryReason } from './accountCoordinatorTypes.js';
+  DiscoveryRecovery, DiscoveryRecoveryReason, ProductionChangeReason, ProductionInventory } from './accountCoordinatorTypes.js';
 
 const fail = (reason: CoordinatorFailure, retryAfterMs?: number): CoordinatorResult =>
   ({ ok: false, reason, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
@@ -94,6 +94,9 @@ class Coordinator implements AccountCoordinator {
   readonly #clock: TokenClock;
   readonly #tokens: TokenManager;
   #context?: Context;
+  #productionEpoch: object = {};
+  #productionPending = new Map<ProductionChangeReason, () => boolean>();
+  #productionQueued = false;
   #credentials?: AuthCredentials;
   #policy?: CompatibilityPolicy;
   #stopped = false;
@@ -135,6 +138,27 @@ class Coordinator implements AccountCoordinator {
       void Promise.resolve(this.#options.onStatus?.(this.getStatus())).catch(() => undefined);
     } catch { /* Observer only. */ }
   }
+  #productionNotice(reason: ProductionChangeReason, current: () => boolean): void {
+    if (typeof this.#options.onProductionChange !== 'function') {
+      return;
+    }
+    // At most five fixed reasons and one microtask; never retain payloads or snapshots.
+    this.#productionPending.set(reason, current);
+    if (this.#productionQueued) {
+      return;
+    }
+    this.#productionQueued = true;
+    void Promise.resolve().then(() => {
+      this.#productionQueued = false;
+      const pending = this.#productionPending;
+      this.#productionPending = new Map();
+      const reasons = [...pending].filter(([, valid]) => valid()).map(([kind]) => kind);
+      if (reasons.length) {
+        return this.#options.onProductionChange?.(Object.freeze({ reasons: Object.freeze(reasons) }));
+      }
+    }).catch(() => undefined);
+  }
+
   #refresh(c: Context): void {
     if (!this.#current(c)) {
       return;
@@ -161,6 +185,10 @@ class Coordinator implements AccountCoordinator {
     this.#context = undefined; // Revoke every callback before abort/stop can reenter.
     if (!c) {
       return;
+    }
+    const epoch = this.#productionEpoch = {};
+    if (reason !== 'stopped') {
+      this.#productionNotice('revoked', () => !this.#stopped && this.#productionEpoch === epoch);
     }
     const operation = c.operation; c.operation = undefined;
     operation?.resolve(fail(reason));
@@ -359,7 +387,11 @@ class Coordinator implements AccountCoordinator {
           if (newSession && this.#commissioning) {
             quiet(() => this.#commissioning!.session(plan.lane, () => live() && slot.status.session === status.session));
           }
-          this.#refresh(c); this.#notify();
+          this.#refresh(c);
+          if (plan.lane === 'production' && accepted.changed) {
+            this.#productionNotice('transport', () => live() && c.production === slot);
+          }
+          this.#notify();
         } catch {
           if (live()) {
             this.#fatal('dependency');
@@ -369,6 +401,11 @@ class Coordinator implements AccountCoordinator {
       onMessage: message => {
         if (live()) {
           const applied = bound.binding.onMessage(message);
+          if (plan.lane === 'production' && applied.accepted && live()) {
+            const session = slot.status.session;
+            this.#productionNotice('observation',
+              () => live() && c.production === slot && slot.status.phase === 'ready' && slot.status.session === session);
+          }
           if (this.#commissioning && live()) {
             quiet(() => this.#commissioning!.message(plan.lane, message, applied,
               () => slot.state.getDevice(message.routeId), () => live() && slot.status.phase === 'ready' && slot.status.session === message.session));
@@ -387,6 +424,8 @@ class Coordinator implements AccountCoordinator {
     return slot;
   }
   #apply(c: Context, result: DiscoveryRunResult): void {
+    const previousProduction = c.production;
+    const previousAuthority = this.#status.authority;
     const snapshot = result.ok ? result.snapshot : result.partial;
     if (c.uuid && snapshot?.account.identitySource === 'uuid' && snapshot.account.id !== c.uuid) {
       this.#fatal('invalidated'); return;
@@ -435,6 +474,10 @@ class Coordinator implements AccountCoordinator {
     if (this.#commissioning && this.#current(c)) {
       quiet(() => this.#commissioning!.discovery(result, approval, c.production?.plan.routes.length ?? 0,
         this.#policy, () => this.#current(c)));
+    }
+    if (this.#current(c) && (c.production !== previousProduction || this.#status.authority !== previousAuthority)) {
+      const production = c.production;
+      this.#productionNotice('inventory', () => this.#current(c) && c.production === production);
     }
     // All slots/bindings are installed before any lifecycle can emit ready and buffered messages.
     for (const slot of this.#slots(c)) {
@@ -612,6 +655,23 @@ class Coordinator implements AccountCoordinator {
       }
     });
   }
+  getProductionInventory(): ProductionInventory {
+    const c = this.#context;
+    const slot = c?.production;
+    if (!c || !this.#current(c) || !slot?.active || slot.plan.lane !== 'production'
+      || (this.#status.authority !== 'current' && this.#status.authority !== 'last-known')) {
+      return Object.freeze({ authority: 'none', devices: Object.freeze([]) });
+    }
+    // Only installed approved plans supply identity. Never project raw discovery or last-known state.
+    return Object.freeze({
+      authority: this.#status.authority, accountUuid: slot.plan.accountUuid, identitySource: 'uuid',
+      devices: Object.freeze(slot.plan.routes.map(route => Object.freeze({
+        routeId: route.routeId, macAddress: route.macAddress,
+        ...(route.identity.name === undefined ? {} : { displayName: route.identity.name }),
+      }))),
+    });
+  }
+
   getStatus(): CoordinatorStatus {
     return structuredClone(this.#status);
   }
@@ -656,6 +716,8 @@ class Coordinator implements AccountCoordinator {
     this.#stopped = true; this.#release('stopped'); this.#credentials = undefined;
     quiet(() => this.#tokens.stop());
     this.#status = { phase: 'stopped', discovery: 'never', authority: 'none', devices: 0, connections: [] };
+    const epoch = this.#productionEpoch;
+    this.#productionNotice('stopped', () => this.#stopped && this.#productionEpoch === epoch);
     this.#notify();
   }
 }
