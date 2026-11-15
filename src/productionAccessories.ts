@@ -3,6 +3,13 @@ import type { AccountCoordinator, ProductionInventory } from './toniebox/account
 import { PLUGIN_NAME } from './settings.js';
 
 export type ProductionReader = Pick<AccountCoordinator, 'getProductionInventory' | 'getDevice'>;
+/** One-shot presentation deadline only; never a backend retry or poll. */
+export interface PresentationTiming {
+  readonly now?: () => number;
+  readonly schedule?: (callback: () => void, ms: number) => () => void;
+}
+const OFFLINE_GRACE_MS = 10000;
+interface Outage { readonly start: number; last: number; expired: boolean; cancel?: () => void }
 export interface ProductionPresentation { refresh(): void; stop(): void }
 // External accessories cannot be publicly unpublished. Bound the process-lifetime registry too.
 const MAX_EXTERNAL_ACCESSORIES = 100;
@@ -12,6 +19,8 @@ interface Entry {
   accessory?: PlatformAccessory;
   current?: Characteristic;
   failed: boolean;
+  outage?: Outage;
+  timingFailed?: boolean;
 }
 type Inventory = Extract<ProductionInventory, { accountUuid: string }>;
 const text = (s: unknown): s is string => typeof s === 'string' && s.length <= 4096 && /\S/u.test(s)
@@ -23,11 +32,12 @@ export function productionAccessoryUuid(api: Pick<API, 'hap'>, account: string, 
   return api.hap.uuid.generate(JSON.stringify([PLUGIN_NAME, 'external-smartspeaker', 1, account, mac.toUpperCase()]));
 }
 
-/** Read-only HAP projection. No state cache, backend ownership, commands, storage or timers.
+/** Read-only HAP projection. No state cache, backend ownership, commands or storage. One cancellable presentation grace deadline per accessory.
  * Homebridge owns pairing/server lifetime. A dispatched publication is never retried in-process:
  * its void API cannot distinguish failure before side effects from failure after publication. */
 export class ProductionAccessories implements ProductionPresentation {
   readonly #api: API;
+  readonly #timing: PresentationTiming;
   readonly #warn: (message: string) => void;
   #reader?: ProductionReader;
   #entries = new Map<string, Entry>();
@@ -36,8 +46,8 @@ export class ProductionAccessories implements ProductionPresentation {
   #queued = false;
   #epoch: object = {};
 
-  constructor(api: API, reader: ProductionReader, warn: (message: string) => void) {
-    this.#api = api; this.#reader = reader; this.#warn = warn;
+  constructor(api: API, reader: ProductionReader, warn: (message: string) => void, timing: PresentationTiming = {}) {
+    this.#timing = timing; this.#api = api; this.#reader = reader; this.#warn = warn;
     // Singular platform: a second owner in the same Homebridge process must not republish externals.
     if (owners.has(api)) {
       this.#stopped = true; this.#reader = undefined;
@@ -99,30 +109,98 @@ export class ProductionAccessories implements ProductionPresentation {
   #unavailable(): Error {
     return new this.#api.hap.HapStatusError(this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
   }
+  #clearOutage(entry: Entry): void {
+    const old = entry.outage; entry.outage = undefined;
+    try {
+      old?.cancel?.();
+    } catch { /* Revoked timer callbacks are inert even if cancellation fails. */ }
+  }
+  #arm(entry: Entry, outage: Outage): void {
+    try {
+      const now = (this.#timing.now ?? (() => performance.now()))();
+      if (!Number.isFinite(now) || now < outage.last) {
+        throw new Error('Invalid presentation clock');
+      }
+      outage.last = now;
+      const remaining = Math.max(0, OFFLINE_GRACE_MS - (now - outage.start));
+      if (remaining === 0) {
+        outage.expired = true; this.refresh(); return;
+      }
+      let scheduling = true;
+      const cancel = (this.#timing.schedule ?? ((fn, ms) => {
+        const timer = setTimeout(fn, ms); timer.unref(); return () => clearTimeout(timer);
+      }))(() => {
+        if (this.#stopped || entry.outage !== outage) {
+          return;
+        }
+        if (scheduling) {
+          entry.timingFailed = true; this.#clearOutage(entry); return;
+        }
+        outage.cancel = undefined;
+        this.#arm(entry, outage);
+      }, remaining);
+      scheduling = false;
+      if (typeof cancel !== 'function') {
+        throw new Error('Invalid presentation scheduler');
+      }
+      outage.cancel = cancel;
+      if (this.#stopped || entry.outage !== outage) {
+        cancel();
+      }
+    } catch {
+      entry.timingFailed = true; this.#clearOutage(entry);
+    }
+  }
   #media(entry: Entry): number {
-    const epoch = this.#epoch, route = this.#route(entry);
-    if (!route) {
-      throw this.#unavailable();
+    const epoch = this.#epoch;
+    let observation;
+    try {
+      const route = this.#route(entry);
+      if (!route) {
+        throw this.#unavailable();
+      }
+      observation = this.#reader?.getDevice(route.routeId, 'production');
+      const still = this.#route(entry);
+      if (this.#stopped || epoch !== this.#epoch || still?.routeId !== route.routeId
+        || observation?.state.identity.id !== route.routeId || observation.state.identity.macAddress !== route.macAddress
+        || !['connected', 'disconnected'].includes(observation.transport.status)) {
+        throw this.#unavailable();
+      }
+    } catch {
+      this.#clearOutage(entry); throw this.#unavailable();
     }
-    const observation = this.#reader?.getDevice(route.routeId, 'production');
-    const still = this.#route(entry);
-    if (this.#stopped || epoch !== this.#epoch || still?.routeId !== route.routeId
-      || observation?.state.identity.id !== route.routeId || observation.state.identity.macAddress !== route.macAddress
-      || observation.transport.status !== 'connected' || observation.freshness['playback/state'] !== 'observed') {
-      throw this.#unavailable();
-    }
-    // The backend alone interprets online evidence, playback flags, retained data and session freshness.
     const C = this.#api.hap.Characteristic.CurrentMediaState;
-    if (observation.playback === 'playing') {
-      return C.PLAY;
+    if (observation.transport.status === 'connected') {
+      const online = observation.state.topics?.['online-state'];
+      // Only explicit live, current-session physical disconnection bypasses the grace period.
+      if (online && ['disconnected', 'offline'].includes(online.value.onlineState) && online.retained === false
+        && online.session === observation.transport.session && observation.freshness['online-state'] === 'observed') {
+        this.#clearOutage(entry);
+        entry.outage = { start: 0, last: 0, expired: true };
+        return C.PAUSE; // Display fallback, not a backend observation or physical command.
+      }
+      if (observation.freshness['playback/state'] === 'observed'
+        && ['playing', 'paused', 'empty'].includes(observation.playback)) {
+        this.#clearOutage(entry); entry.timingFailed = false;
+        return observation.playback === 'playing' ? C.PLAY : observation.playback === 'paused' ? C.PAUSE : C.STOP;
+      }
+    } else if (observation.transport.status === 'disconnected' && !entry.outage && !entry.timingFailed) {
+      try {
+        const now = (this.#timing.now ?? (() => performance.now()))();
+        if (!Number.isFinite(now) || now < 0) {
+          throw new Error('Invalid presentation clock');
+        }
+        const outage: Outage = { start: now, last: now, expired: false }; entry.outage = outage;
+        this.#arm(entry, outage);
+      } catch {
+        entry.timingFailed = true; this.#clearOutage(entry);
+      }
     }
-    if (observation.playback === 'paused') {
+    // Reconnection/retained history alone cannot restore PLAY or restart the deadline.
+    if (entry.outage?.expired) {
       return C.PAUSE;
     }
-    if (observation.playback === 'empty') {
-      return C.STOP;
-    }
-    throw this.#unavailable(); // inactive/unknown are not invented Pause, Stop or Loading states.
+    throw this.#unavailable();
   }
   #build(entry: Entry): void {
     const { Service: S, Characteristic: C, Categories, HAPStatus } = this.#api.hap;
@@ -192,6 +270,7 @@ export class ProductionAccessories implements ProductionPresentation {
     }
   }
   #fault(entry: Entry): void {
+    this.#clearOutage(entry);
     try {
       entry.current?.updateValue(this.#unavailable());
     } catch { /* A broken host characteristic cannot regain read authority. */ }
