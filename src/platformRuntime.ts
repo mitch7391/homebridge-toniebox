@@ -1,11 +1,13 @@
+import type { ProductionPresentation, ProductionReader } from './productionAccessories.js';
 import { COMMISSIONING_BUILD } from './toniebox/commissioning.js';
 import { performance } from 'node:perf_hooks';
 import { createAccountCoordinator } from './toniebox/accountCoordinator.js';
 import type { AuthCredentials } from './toniebox/authTypes.js';
-import type { AccountCoordinator, CoordinatorResult, CoordinatorStatus } from './toniebox/accountCoordinatorTypes.js';
+import type { AccountCoordinator, CoordinatorResult, CoordinatorStatus, ProductionChange } from './toniebox/accountCoordinatorTypes.js';
 
 export interface PlatformRuntimeOptions {
-  readonly coordinatorFactory?: (onStatus: (status: CoordinatorStatus) => void) => AccountCoordinator;
+  readonly coordinatorFactory?: (onStatus: (status: CoordinatorStatus) => void, onProductionChange: (notice: ProductionChange) => void) => AccountCoordinator;
+  readonly presentationFactory?: (reader: ProductionReader) => ProductionPresentation;
   readonly now?: () => number;
   readonly schedule?: (callback: () => void, delayMs: number) => () => void;
   readonly jitter?: () => number;
@@ -16,6 +18,7 @@ export interface RuntimeLogger {
 }
 const messages = {
   starting: 'Toniebox backend starting.',
+  presentation: 'Toniebox accessory presentation requires attention; backend operation continues.',
   missing: 'Toniebox credentials are not configured; backend inactive.',
   invalid: 'Toniebox credentials are invalid or incomplete; backend inactive.',
   complete: 'Toniebox discovery completed.',
@@ -56,6 +59,7 @@ export class PlatformRuntime {
   #launched = false;
   #stopped = false;
   #coordinator?: AccountCoordinator;
+  #presentation?: ProductionPresentation;
   #flight?: Flight;
   #alarm?: Alarm;
   #retry = 0;
@@ -157,7 +161,7 @@ export class PlatformRuntime {
       if (this.#stopped) {
         return;
       }
-      const coordinator = (this.#options.coordinatorFactory ?? (onStatus => createAccountCoordinator({ onStatus,
+      const coordinator = (this.#options.coordinatorFactory ?? ((onStatus, onProductionChange) => createAccountCoordinator({ onStatus, onProductionChange,
         ...(COMMISSIONING_BUILD ? { onCommissioning: event => {
           if (!this.#stopped) {
             try {
@@ -165,11 +169,31 @@ export class PlatformRuntime {
             } catch { /* Passive diagnostics cannot affect ownership. */ }
           }
         } } : {}),
-      })))(s => this.#status(s));
+      })))(s => this.#status(s), () => {
+        if (!this.#stopped) {
+          quietly(() => {
+            void Promise.resolve(this.#presentation?.refresh()).catch(() => undefined);
+          });
+        }
+      });
       if (this.#stopped) {
         quietly(() => coordinator.stop()); return;
       }
       this.#coordinator = coordinator;
+      if (this.#options.presentationFactory) {
+        try {
+          const presentation = this.#options.presentationFactory(coordinator);
+          if (this.#stopped) {
+            quietly(() => {
+              void Promise.resolve(presentation.stop()).catch(() => undefined);
+            }); return;
+          }
+          this.#presentation = presentation;
+        } catch {
+          // Presentation failure must not change backend authentication or discovery ownership.
+          this.#notice('presentation');
+        }
+      }
       if (COMMISSIONING_BUILD) {
         try {
           void Promise.resolve(this.#log.info('Toniebox commissioning diagnostics active; bounded output.')).catch(() => undefined);
@@ -305,6 +329,10 @@ export class PlatformRuntime {
     this.#stopped = true;
     const alarm = this.#alarm, flight = this.#flight, coordinator = this.#coordinator;
     this.#alarm = undefined; this.#flight = undefined; this.#coordinator = undefined; this.#credentials = undefined;
+    const presentation = this.#presentation; this.#presentation = undefined;
+    quietly(() => {
+      void Promise.resolve(presentation?.stop()).catch(() => undefined);
+    });
     quietly(() => alarm?.cancel?.());
     quietly(() => flight?.controller.abort());
     quietly(() => coordinator?.stop());
