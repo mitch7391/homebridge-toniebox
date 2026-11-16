@@ -106,6 +106,9 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     f.current = (i = 0) => f.accessory(i).getService(S.SmartSpeaker).getCharacteristic(C.CurrentMediaState);
     return f;
   };
+  const unknown = async characteristic => {
+    assert.equal(await characteristic.handleGetRequest(), 3); assert.equal(characteristic.statusCode, H.SUCCESS);
+  };
   const unavailable = characteristic => assert.rejects(characteristic.handleGetRequest(), e => e === H.SERVICE_COMMUNICATION_FAILURE);
 
   await t.test('construction is inert; publication is coalesced, external, primary and minimal', async () => {
@@ -171,7 +174,7 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
         f.observation.playback = mode;
       }
       if (['retained', 'last-known'].includes(mode)) {
-        f.observation.freshness['playback/state'] = mode;
+        f.observation.freshness['playback/state'] = mode; f.observation.playback = 'unknown';
       }
       if (mode === 'disconnected') {
         f.observation.transport.status = 'disconnected';
@@ -179,16 +182,24 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
       if (mode === 'wrong-device') {
         f.observation.state.identity.macAddress = 'WRONG';
       }
-      await f.refresh(); await unavailable(f.current()); assert.equal(f.current().statusCode, H.SERVICE_COMMUNICATION_FAILURE);
+      await f.refresh();
+      if (mode === 'wrong-device') {
+        await unavailable(f.current());
+      } else if (mode === 'disconnected') {
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
+      } else {
+        await unknown(f.current());
+      }
     });
   }
   await t.test('unknown initial observation has no successful default Playing read', async () => {
-    const f = setup(); f.observation = undefined; await f.refresh(); await unavailable(f.current());
+    const f = setup(); f.observation = undefined; await f.refresh(); await unknown(f.current());
   });
   await t.test('reconnect remains unavailable until backend supplies fresh accepted playback', async () => {
-    const f = setup(); await f.refresh(); f.observation.transport.status = 'disconnected'; await f.refresh(); await unavailable(f.current());
+    const f = setup(); await f.refresh(); f.observation.transport.status = 'disconnected'; await f.refresh();
+    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
     f.observation.transport = { status: 'connected', session: 2 }; f.observation.freshness['playback/state'] = 'retained';
-    await f.refresh(); await unavailable(f.current());
+    await f.refresh(); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
     f.observation.freshness['playback/state'] = 'observed'; await f.refresh();
     assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY); assert.equal(f.published.length, 1);
   });
@@ -329,18 +340,18 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     manager = new ProductionAccessories(host, coordinator, () => {}); managers.push(manager);
     try {
       coordinator.setCredentials({ username: 'SYNTHETIC', password: 'SECRET' }); coordinator.start(); await coordinator.discover(); await drain();
-      assert.equal(lifecycles.length, 2); assert.equal(f.published.length, 1); await unavailable(f.current());
+      assert.equal(lifecycles.length, 2); assert.equal(f.published.length, 1); await unknown(f.current());
       const message = (topic, value, retained = false) => lifecycles[0].onMessage({ routeId: 'SYNTHETIC_ROUTE',
         topic: 'external/toniebox/' + mac + '/' + topic, payload: new TextEncoder().encode(JSON.stringify(value)),
         retained, receivedAtMs: 100, session: 1, duplicate: false, qos: 1 });
       message('online-state', { onlineState: 'connected' }, true);
-      message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, true); await drain(); await unavailable(f.current());
+      message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, true); await drain(); await unknown(f.current());
       message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
       assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
       message('online-state', { onlineState: 'disconnected' }); await drain();
-      assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+      assert.equal(await f.current().handleGetRequest(), 3);
       message('online-state', { onlineState: 'connected' }, true); await drain();
-      assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+      assert.equal(await f.current().handleGetRequest(), 3);
       coordinator.invalidate(); await drain(); await unavailable(f.current()); assert.equal(f.published.length, 1);
     } finally {
       manager.stop(); coordinator.stop();
@@ -435,38 +446,38 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     assert.equal(f.reads.length, reads); assert.equal(f.published.length, publications);
     assert.equal(f.observation.playback, 'playing'); assert.deepEqual(f.logs, []);
   });
-  await t.test('live physical offline pushes PAUSE, while retained or old-session offline does not', async () => {
+  await t.test('live physical offline pushes UNKNOWN, while retained or old-session offline does not', async () => {
     const f = setup(); await f.refresh(); const changes = []; f.current().on('change', e => changes.push(e.newValue));
     f.observation.playback = 'unknown';
     f.observation.state.topics = { 'online-state': { value: { onlineState: 'disconnected' }, session: 1, retained: true } };
-    f.observation.freshness['online-state'] = 'retained'; await f.refresh(); await unavailable(f.current());
+    f.observation.freshness['online-state'] = 'retained'; await f.refresh(); await unknown(f.current());
     f.observation.state.topics['online-state'].retained = false; f.observation.state.topics['online-state'].session = 0;
-    f.observation.freshness['online-state'] = 'observed'; await f.refresh(); await unavailable(f.current());
+    f.observation.freshness['online-state'] = 'observed'; await f.refresh(); await unknown(f.current());
     f.observation.state.topics['online-state'].session = 1; await f.refresh();
-    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE); assert.ok(changes.includes(C.CurrentMediaState.PAUSE));
+    assert.equal(await f.current().handleGetRequest(), 3); assert.ok(changes.includes(3));
     assert.equal(f.observation.playback, 'unknown'); assert.equal(f.jobs.size, 0);
     await unavailable(f.accessory().getService(S.SmartSpeaker).getCharacteristic(C.TargetMediaState));
   });
   await t.test('two-second interruption cancels grace on fresh recovery without a false PAUSE', async () => {
     const f = setup(); await f.refresh(); const changes = []; f.current().on('change', e => changes.push(e.newValue));
     f.observation.transport.status = 'disconnected'; await f.refresh(); await f.refresh(); assert.equal(f.jobs.size, 1);
-    await f.elapse(2000); assert.equal(f.jobs.size, 1); await unavailable(f.current());
+    await f.elapse(2000); assert.equal(f.jobs.size, 1); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
     f.observation = observation(); await f.refresh(); assert.equal(f.jobs.size, 0);
-    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY); assert.ok(!changes.includes(C.CurrentMediaState.PAUSE));
+    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY); assert.ok(!changes.includes(3));
   });
-  await t.test('sustained loss pushes PAUSE once and retained reconnect cannot revive PLAY', async () => {
+  await t.test('sustained loss pushes UNKNOWN once and retained reconnect cannot revive PLAY', async () => {
     const f = setup(); await f.refresh(); const changes = []; f.current().on('change', e => changes.push(e.newValue));
     f.observation.transport.status = 'disconnected'; await f.refresh(); await f.elapse(10000);
-    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE); assert.equal(f.jobs.size, 0);
+    assert.equal(await f.current().handleGetRequest(), 3); assert.equal(f.jobs.size, 0);
     f.observation = observation('unknown'); f.observation.freshness['playback/state'] = 'retained';
-    await f.refresh(); await f.refresh(); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
-    assert.equal(changes.filter(v => v === C.CurrentMediaState.PAUSE).length, 1);
+    await f.refresh(); await f.refresh(); assert.equal(await f.current().handleGetRequest(), 3);
+    assert.equal(changes.filter(v => v === 3).length, 1);
     f.observation = observation('playing'); await f.refresh(); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
   });
   await t.test('reconnection awaiting fresh evidence preserves original grace deadline', async () => {
     const f = setup(); await f.refresh(); f.observation.transport.status = 'disconnected'; await f.refresh(); await f.elapse(2000);
     f.observation = observation('unknown'); f.observation.freshness['playback/state'] = 'retained'; await f.refresh();
-    await f.elapse(8000); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+    await f.elapse(8000); assert.equal(await f.current().handleGetRequest(), 3);
   });
   for (const action of ['revoke', 'mismatch', 'invalid', 'stop']) {
     await t.test('grace cleanup and late timer isolation: ' + action, async () => {
@@ -503,7 +514,7 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
           fn(); return () => {};
         };
       }
-      await f.refresh(); await unavailable(f.current()); assert.equal(f.jobs.size, 0);
+      await f.refresh(); await unknown(f.current()); assert.equal(f.jobs.size, 0);
     });
   }
   await t.test('failed cancellation cannot revive a revoked grace callback', async () => {
@@ -519,8 +530,43 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
   await t.test('explicit offline is recognised but unsupported online values are not guessed', async () => {
     const f = setup(); await f.refresh(); f.observation.playback = 'unknown';
     f.observation.state.topics = { 'online-state': { value: { onlineState: 'unsupported' }, session: 1, retained: false } };
-    f.observation.freshness['online-state'] = 'observed'; await f.refresh(); await unavailable(f.current());
+    f.observation.freshness['online-state'] = 'observed'; await f.refresh(); await unknown(f.current());
     f.observation.state.topics['online-state'].value.onlineState = 'offline'; await f.refresh();
-    assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+    assert.equal(await f.current().handleGetRequest(), 3);
   });
+  await t.test('instance-local UNKNOWN is accepted, notified and advertised without global changes', async () => {
+    const f = setup(); await f.refresh(); const c = f.current(), changes = [];
+    c.on('change', e => changes.push(e.newValue)); f.observation = observation('unknown'); await f.refresh();
+    await unknown(c); assert.ok(changes.includes(3));
+    // Synthetic instance ID supplies the offline serializer prerequisite; no server is published.
+    c.iid = 1; const wire = await c.toHAP(undefined, false);
+    assert.deepEqual(wire['valid-values'], [0, 1, 2, 3, 4, 5]); assert.equal(wire.value, 3);
+    assert.deepEqual(new C.CurrentMediaState().props.validValues, [0, 1, 2, 4, 5]);
+    assert.equal(C.CurrentMediaState.UNKNOWN, undefined);
+    assert.deepEqual(f.accessory().getService(S.SmartSpeaker).getCharacteristic(C.TargetMediaState).props.validValues, [0, 1, 2]);
+  });
+  for (const [playback, expected] of [['playing', C.CurrentMediaState.PLAY], ['paused', C.CurrentMediaState.PAUSE], ['empty', C.CurrentMediaState.STOP]]) {
+    await t.test('successive sessions restore ' + playback + ' and obsolete timers cannot overwrite it', async () => {
+      const f = setup(); await f.refresh();
+      for (let session = 2; session <= 5; session++) {
+        f.observation.transport.status = 'disconnected'; await f.refresh(); const late = [...f.jobs][0].fn;
+        f.observation = observation('unknown'); f.observation.transport.session = session;
+        f.observation.freshness['playback/state'] = 'last-known'; await f.refresh();
+        await f.elapse(10000); await unknown(f.current());
+        f.observation = observation(playback); f.observation.transport.session = session; await f.refresh();
+        assert.equal(f.jobs.size, 0); late(); await drain();
+        assert.equal(await f.current().handleGetRequest(), expected); assert.equal(f.jobs.size, 0);
+      }
+    });
+  }
+  await t.test('session replacement without an intermediate hint still has one bounded grace', async () => {
+    const f = setup(); await f.refresh(); f.observation = observation('unknown'); f.observation.transport.session = 2;
+    await f.refresh(); assert.equal(f.jobs.size, 1); assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
+    await f.elapse(10000); await unknown(f.current()); assert.equal(f.jobs.size, 0);
+  });
+  await t.test('cold disconnected startup never fabricates playback during grace', async () => {
+    const f = setup(); f.observation = observation('unknown'); f.observation.transport.status = 'disconnected';
+    await f.refresh(); await unknown(f.current()); await f.elapse(10000); await unknown(f.current());
+  });
+
 });

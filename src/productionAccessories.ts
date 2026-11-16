@@ -8,6 +8,9 @@ export interface PresentationTiming {
   readonly now?: () => number;
   readonly schedule?: (callback: () => void, ms: number) => () => void;
 }
+// Apple HMCharacteristicValueCurrentMediaState.unknown = 3; absent from HAP-NodeJS 2.2.2 constants.
+// https://developer.apple.com/documentation/homekit/hmcharacteristicvaluecurrentmediastate
+const APPLE_MEDIA_UNKNOWN = 3;
 const OFFLINE_GRACE_MS = 10000;
 interface Outage { readonly start: number; last: number; expired: boolean; cancel?: () => void }
 export interface ProductionPresentation { refresh(): void; stop(): void }
@@ -21,6 +24,8 @@ interface Entry {
   failed: boolean;
   outage?: Outage;
   timingFailed?: boolean;
+  confirmed?: number;
+  session?: number;
 }
 type Inventory = Extract<ProductionInventory, { accountUuid: string }>;
 const text = (s: unknown): s is string => typeof s === 'string' && s.length <= 4096 && /\S/u.test(s)
@@ -32,7 +37,8 @@ export function productionAccessoryUuid(api: Pick<API, 'hap'>, account: string, 
   return api.hap.uuid.generate(JSON.stringify([PLUGIN_NAME, 'external-smartspeaker', 1, account, mac.toUpperCase()]));
 }
 
-/** Read-only HAP projection. No state cache, backend ownership, commands or storage. One cancellable presentation grace deadline per accessory.
+/** Read-only HAP projection. No backend state ownership, commands or storage. Only a bounded last-confirmed presentation.
+ * One cancellable presentation grace deadline per accessory.
  * Homebridge owns pairing/server lifetime. A dispatched publication is never retried in-process:
  * its void API cannot distinguish failure before side effects from failure after publication. */
 export class ProductionAccessories implements ProductionPresentation {
@@ -161,13 +167,17 @@ export class ProductionAccessories implements ProductionPresentation {
       }
       observation = this.#reader?.getDevice(route.routeId, 'production');
       const still = this.#route(entry);
+      if (!observation && !this.#stopped && epoch === this.#epoch && still?.routeId === route.routeId) {
+        this.#clearOutage(entry); entry.confirmed = undefined; entry.session = undefined;
+        return APPLE_MEDIA_UNKNOWN;
+      }
       if (this.#stopped || epoch !== this.#epoch || still?.routeId !== route.routeId
         || observation?.state.identity.id !== route.routeId || observation.state.identity.macAddress !== route.macAddress
         || !['connected', 'disconnected'].includes(observation.transport.status)) {
         throw this.#unavailable();
       }
     } catch {
-      this.#clearOutage(entry); throw this.#unavailable();
+      this.#clearOutage(entry); entry.confirmed = undefined; entry.session = undefined; throw this.#unavailable();
     }
     const C = this.#api.hap.Characteristic.CurrentMediaState;
     if (observation.transport.status === 'connected') {
@@ -177,14 +187,23 @@ export class ProductionAccessories implements ProductionPresentation {
         && online.session === observation.transport.session && observation.freshness['online-state'] === 'observed') {
         this.#clearOutage(entry);
         entry.outage = { start: 0, last: 0, expired: true };
-        return C.PAUSE; // Display fallback, not a backend observation or physical command.
+        entry.confirmed = undefined;
+        return APPLE_MEDIA_UNKNOWN;
       }
       if (observation.freshness['playback/state'] === 'observed'
         && ['playing', 'paused', 'empty'].includes(observation.playback)) {
         this.#clearOutage(entry); entry.timingFailed = false;
-        return observation.playback === 'playing' ? C.PLAY : observation.playback === 'paused' ? C.PAUSE : C.STOP;
+        entry.session = observation.transport.session;
+        entry.confirmed = observation.playback === 'playing' ? C.PLAY : observation.playback === 'paused' ? C.PAUSE : C.STOP;
+        return entry.confirmed;
       }
-    } else if (observation.transport.status === 'disconnected' && !entry.outage && !entry.timingFailed) {
+      // The backend projection already applies playbackActivity's session and retained-message rules.
+      if (observation.playback === 'inactive') {
+        this.#clearOutage(entry); entry.confirmed = undefined; return APPLE_MEDIA_UNKNOWN;
+      }
+    }
+    if ((observation.transport.status === 'disconnected' || (entry.session !== undefined
+      && entry.session !== observation.transport.session)) && !entry.outage && !entry.timingFailed) {
       try {
         const now = (this.#timing.now ?? (() => performance.now()))();
         if (!Number.isFinite(now) || now < 0) {
@@ -198,9 +217,13 @@ export class ProductionAccessories implements ProductionPresentation {
     }
     // Reconnection/retained history alone cannot restore PLAY or restart the deadline.
     if (entry.outage?.expired) {
-      return C.PAUSE;
+      entry.confirmed = undefined; return APPLE_MEDIA_UNKNOWN;
     }
-    throw this.#unavailable();
+    if (entry.outage && !entry.timingFailed) {
+      return entry.confirmed ?? APPLE_MEDIA_UNKNOWN;
+    }
+    entry.confirmed = undefined;
+    return APPLE_MEDIA_UNKNOWN;
   }
   #build(entry: Entry): void {
     const { Service: S, Characteristic: C, Categories, HAPStatus } = this.#api.hap;
@@ -215,6 +238,7 @@ export class ProductionAccessories implements ProductionPresentation {
     const speaker = accessory.addService(S.SmartSpeaker, 'Toniebox');
     speaker.setPrimaryService(true);
     const current = speaker.getCharacteristic(C.CurrentMediaState); entry.current = current;
+    current.setProps({ validValues: [...new Set([...(current.props.validValues ?? []), APPLE_MEDIA_UNKNOWN])].sort((a, b) => a - b) });
     // Public synchronous callback prevents onGet's awaited return from restoring a revoked cached value.
     current.on('get', callback => {
       let value: number;
@@ -270,7 +294,7 @@ export class ProductionAccessories implements ProductionPresentation {
     }
   }
   #fault(entry: Entry): void {
-    this.#clearOutage(entry);
+    this.#clearOutage(entry); entry.confirmed = undefined; entry.session = undefined;
     try {
       entry.current?.updateValue(this.#unavailable());
     } catch { /* A broken host characteristic cannot regain read authority. */ }
