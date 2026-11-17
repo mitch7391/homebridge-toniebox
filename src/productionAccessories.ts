@@ -182,16 +182,15 @@ export class ProductionAccessories implements ProductionPresentation {
     const C = this.#api.hap.Characteristic.CurrentMediaState;
     if (observation.transport.status === 'connected') {
       const online = observation.state.topics?.['online-state'];
-      // Only explicit live, current-session physical disconnection bypasses the grace period.
-      if (online && ['disconnected', 'offline'].includes(online.value.onlineState) && online.retained === false
-        && online.session === observation.transport.session && observation.freshness['online-state'] === 'observed') {
+      // Current-session physical disconnection (live or retained) bypasses the transport grace.
+      if (online && ['disconnected', 'offline'].includes(online.value.onlineState)
+        && online.session === observation.transport.session) {
         this.#clearOutage(entry);
         entry.outage = { start: 0, last: 0, expired: true };
         entry.confirmed = undefined;
         return APPLE_MEDIA_UNKNOWN;
       }
-      if (observation.freshness['playback/state'] === 'observed'
-        && ['playing', 'paused', 'empty'].includes(observation.playback)) {
+      if (['playing', 'paused', 'empty'].includes(observation.playback)) {
         this.#clearOutage(entry); entry.timingFailed = false;
         entry.session = observation.transport.session;
         entry.confirmed = observation.playback === 'playing' ? C.PLAY : observation.playback === 'paused' ? C.PAUSE : C.STOP;
@@ -215,7 +214,7 @@ export class ProductionAccessories implements ProductionPresentation {
         entry.timingFailed = true; this.#clearOutage(entry);
       }
     }
-    // Reconnection/retained history alone cannot restore PLAY or restart the deadline.
+    // Readiness alone cannot restore PLAY or restart the deadline; usable playback above cancels it.
     if (entry.outage?.expired) {
       entry.confirmed = undefined; return APPLE_MEDIA_UNKNOWN;
     }

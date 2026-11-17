@@ -102,15 +102,15 @@ test('semantic duplicates refresh receipt metadata without a payload change', ()
   assert.equal(receive(second.state, 'volume/state', { level: 9 }).changed, true, 'Omitted percentage is a real snapshot change');
 });
 
-test('retained pairs, live online alone and live unrelated topics do not establish playback activity', () => {
+test('retained pairs establish activity without changing delivery freshness or extrapolating position', () => {
   let state = online(createDeviceState(identity), { retained: true });
   state = receive(state, 'playback/state', playing, { retained: true }).state;
   assert.equal(snapshotFreshness(state.topics['playback/state'], connected), 'retained');
-  assert.equal(playbackActivity(state, connected), 'unknown');
+  assert.equal(playbackActivity(state, connected), 'playing');
   assert.equal(playbackPositionMs(state, connected, delivery.receivedAtMs), undefined);
   state = online(state);
   state = receive(state, 'metrics/battery', { percent: 64 }).state;
-  assert.equal(playbackActivity(state, connected), 'unknown');
+  assert.equal(playbackActivity(state, connected), 'playing');
   assert.equal(receive(state, 'playback/state', playing).changed, false);
   state = receive(state, 'playback/state', playing).state;
   assert.equal(playbackActivity(state, connected), 'playing');
@@ -153,7 +153,7 @@ test('transport loss and new sessions preserve last-known data without resurrect
   let restored = online(state, { session: 2, retained: true }, nextSession);
   assert.equal(playbackActivity(restored, nextSession), 'unknown');
   restored = receive(restored, 'playback/state', playing, { session: 2, retained: true }, nextSession).state;
-  assert.equal(playbackActivity(restored, nextSession), 'unknown');
+  assert.equal(playbackActivity(restored, nextSession), 'playing');
   restored = receive(restored, 'playback/state', playing, { session: 2 }, nextSession).state;
   assert.equal(playbackActivity(restored, nextSession), 'playing');
 });
@@ -264,11 +264,12 @@ test('delivery extras and duplicate hints cannot enter snapshots or suppress cha
   assert.equal(JSON.stringify(next.state).includes('SYNTHETIC_PRIVATE'), false);
 });
 
-test('retained redelivery after live playback revokes activity even when the payload is identical', () => {
+test('retained redelivery after live playback preserves the live snapshot even when identical', () => {
   const state = active();
   const replay = receive(state, 'playback/state', playing, { retained: true });
   assert.equal(replay.changed, false);
-  assert.equal(playbackActivity(replay.state, connected), 'unknown');
+  assert.equal(replay.accepted, false); assert.equal(replay.state, state);
+  assert.equal(playbackActivity(replay.state, connected), 'playing');
   assert.equal(playbackActivity(state, connected), 'playing');
 });
 
@@ -337,7 +338,7 @@ test('initial retained online snapshots remain replaceable until a live online o
   const retainedConnected = receive(state, 'online-state', { onlineState: 'connected' }, { retained: true });
   assert.equal(retainedConnected.accepted, true);
   state = receive(retainedConnected.state, 'playback/state', playing, { retained: true }).state;
-  assert.equal(playbackActivity(state, connected), 'unknown');
+  assert.equal(playbackActivity(state, connected), 'playing');
   state = receive(state, 'playback/state', playing).state;
   assert.equal(playbackActivity(state, connected), 'playing');
   const liveOnline = receive(state, 'online-state', { onlineState: 'connected' });
@@ -346,7 +347,7 @@ test('initial retained online snapshots remain replaceable until a live online o
   assert.equal(snapshotFreshness(liveOnline.state.topics['online-state'], connected), 'observed');
 });
 
-test('live online precedence is session-local; reconnect still requires new-session live playback', () => {
+test('live online precedence is session-local; reconnect accepts new-session retained playback', () => {
   const previous = freeze(receive(active(), 'online-state', { onlineState: 'offline' }).state);
   const disconnected = { status: 'disconnected', session: 1 };
   const next = { status: 'connected', session: 2 };
@@ -364,7 +365,7 @@ test('live online precedence is session-local; reconnect still requires new-sess
     state = initialOnline.state;
     if (!playbackFirst) {
       state = receive(state, 'playback/state', playing, { session: 2, retained: true }, next).state;
-      assert.equal(playbackActivity(state, next), 'unknown');
+      assert.equal(playbackActivity(state, next), 'playing');
       state = receive(state, 'playback/state', playing, { session: 2 }, next).state;
     }
     assert.equal(playbackActivity(state, next), 'playing');
@@ -376,5 +377,42 @@ test('live online precedence is session-local; reconnect still requires new-sess
     state = online(state, { session: 2 }, next);
     assert.equal(playbackActivity(state, next), 'unknown', 'Live recovery does not resurrect playback predating the offline report');
     assert.equal(playbackActivity(receive(state, 'playback/state', playing, { session: 2 }, next).state, next), 'playing');
+  }
+});
+
+for (const [label, payload, expected] of [
+  ['playing', playing, 'playing'], ['paused', { ...playing, paused: true }, 'paused'], ['empty', { tonie: null }, 'empty'],
+]) {
+  for (const playbackFirst of [false, true]) {
+    test('recovery: retained ' + label + ' establishes activity in either subscription order ' + playbackFirst, () => {
+      let state = createDeviceState(identity);
+      for (const session of [1, 2, 3, 4]) {
+        const transport = { status: 'connected', session }, meta = { session, retained: true };
+        assert.equal(playbackActivity(state, transport), 'unknown');
+        if (playbackFirst) {
+          state = receive(state, 'playback/state', payload, meta, transport).state;
+          assert.equal(playbackActivity(state, transport), 'unknown');
+          state = online(state, meta, transport);
+        } else {
+          state = online(state, meta, transport);
+          assert.equal(playbackActivity(state, transport), 'unknown');
+          state = receive(state, 'playback/state', payload, meta, transport).state;
+        }
+        assert.equal(playbackActivity(state, transport), expected);
+        assert.equal(snapshotFreshness(state.topics['playback/state'], transport), 'retained');
+        assert.equal(receive(state, 'playback/state', playing, { session: session - 1 }, transport).accepted, false);
+      }
+    });
+  }
+}
+test('recovery: same-session live playback wins over delayed retained snapshots', () => {
+  for (const paused of [true, false]) {
+    let state = receive(online(), 'playback/state', { ...playing, paused: !paused }, { retained: true }).state;
+    state = receive(state, 'playback/state', { ...playing, paused }).state;
+    for (const payload of [playing, { ...playing, paused: true }, { tonie: null }]) {
+      const replay = receive(state, 'playback/state', payload, { retained: true, receivedAtMs: delivery.receivedAtMs + 1000 });
+      assert.deepEqual(replay, { state, accepted: false, changed: false });
+      assert.equal(playbackActivity(replay.state, connected), paused ? 'paused' : 'playing');
+    }
   }
 });

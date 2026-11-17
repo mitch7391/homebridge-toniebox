@@ -664,7 +664,7 @@ test('commissioning all seven categories use existing parser outcomes without pa
   }
   await drain(); const e=events.filter(e=>e.kind==='messages').at(-1);
   assert.deepEqual(Object.values(e.acceptedCoverage),Array(7).fill(1));
-  assert.equal(f.c.getDevice('SYNTHETIC_A').playback,'unknown');
+  assert.equal(f.c.getDevice('SYNTHETIC_A').playback,'playing');
   assert.doesNotMatch(JSON.stringify(events),/SYNTHETIC|playing/);
 });
 

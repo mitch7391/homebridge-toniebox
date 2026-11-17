@@ -310,54 +310,80 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     api.emit('shutdown'); notice({ reasons: ['observation'] }); await drain();
     await unavailable(f.current()); assert.deepEqual(calls, ['start', 'discover', 'stop']);
   });
-  await t.test('real coordinator and backend state supply fresh read-only playback with experimental exclusion', async () => {
-    const f = setup(); f.manager.stop(); const jobs = new Set(), lifecycles = []; let manager;
-    const ok = value => ({ ok: true, value, diagnostics: {
-      rejectedEntries: 0, degradedEntries: 0, duplicateEntries: 0, ambiguousRoutingEntries: 0, continuationDetected: false,
-    } });
-    const coordinator = createAccountCoordinator({
-      clock: { now: () => ({ monotonicMs: 0, wallMs: 0 }) }, scheduler: { schedule(fn, ms) {
-        const job = { fn, ms }; jobs.add(job); return () => jobs.delete(job);
-      } },
-      authClient: { login: async () => ({ ok: true, tokens: {
-        accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH', expiresInSeconds: 300, tokenType: 'Bearer',
-      } }), refresh: deny },
-      discoveryClient: { getAccount: async () => ok({ id: account, identitySource: 'uuid' }),
-        getHouseholds: async () => ok([{ id: 'SYNTHETIC_HOUSE' }]), getTonieboxes: async () => ok([
-          { id: 'SYNTHETIC_ROUTE', macAddress: mac, product: 'tb2', generation: 'tng', features: ['playbackControls'] },
-          { id: 'EXPERIMENT', macAddress: 'OTHER_MAC', product: 'unknown', generation: 'unknown', features: ['playbackControls'] },
-        ]) },
-      policy: { rules: [{ product: 'unknown', generation: 'unknown', family: 'unknown', decision: 'experimental',
-        protocol: 'ici-seven-state-topics', evidence: 'SYNTHETIC_APPROVAL' }] },
-      lifecycleFactory: options => {
-        lifecycles.push(options); return {
-          start: () => options.onStatus({ phase: 'ready', connected: true, session: 1 }), stop() {}, getStatus: () => ({ phase: 'idle', connected: false }),
-        };
-      }, onProductionChange: () => manager?.refresh(),
+  for (const [initial, expected] of [[{ tonie: 'SYNTHETIC_CONTENT', paused: false }, C.CurrentMediaState.PLAY],
+    [{ tonie: 'SYNTHETIC_CONTENT', paused: true }, C.CurrentMediaState.PAUSE], [{ tonie: null }, C.CurrentMediaState.STOP]]) {
+    await t.test('real coordinator retained startup and repeated recovery: ' + expected, async () => {
+      const f = setup(); f.manager.stop(); const jobs = new Set(), lifecycles = []; let manager;
+      const ok = value => ({ ok: true, value, diagnostics: {
+        rejectedEntries: 0, degradedEntries: 0, duplicateEntries: 0, ambiguousRoutingEntries: 0, continuationDetected: false,
+      } });
+      const coordinator = createAccountCoordinator({
+        clock: { now: () => ({ monotonicMs: 0, wallMs: 0 }) }, scheduler: { schedule(fn, ms) {
+          const job = { fn, ms }; jobs.add(job); return () => jobs.delete(job);
+        } },
+        authClient: { login: async () => ({ ok: true, tokens: {
+          accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH', expiresInSeconds: 300, tokenType: 'Bearer',
+        } }), refresh: deny },
+        discoveryClient: { getAccount: async () => ok({ id: account, identitySource: 'uuid' }),
+          getHouseholds: async () => ok([{ id: 'SYNTHETIC_HOUSE' }]), getTonieboxes: async () => ok([
+            { id: 'SYNTHETIC_ROUTE', macAddress: mac, product: 'tb2', generation: 'tng', features: ['playbackControls'] },
+            { id: 'EXPERIMENT', macAddress: 'OTHER_MAC', product: 'unknown', generation: 'unknown', features: ['playbackControls'] },
+          ]) },
+        policy: { rules: [{ product: 'unknown', generation: 'unknown', family: 'unknown', decision: 'experimental',
+          protocol: 'ici-seven-state-topics', evidence: 'SYNTHETIC_APPROVAL' }] },
+        lifecycleFactory: options => {
+          lifecycles.push(options); return {
+            start: () => options.onStatus({ phase: 'ready', connected: true, session: 1 }), stop() {}, getStatus: () => ({ phase: 'idle', connected: false }),
+          };
+        }, onProductionChange: () => manager?.refresh(),
+      });
+      const host = new EventEmitter(); Object.assign(host, { hap, platformAccessory: PlatformAccessory,
+        publishExternalAccessories: f.api.publishExternalAccessories });
+      manager = new ProductionAccessories(host, coordinator, () => {}, f.timing); managers.push(manager);
+      try {
+        coordinator.setCredentials({ username: 'SYNTHETIC', password: 'SECRET' }); coordinator.start(); await coordinator.discover(); await drain();
+        assert.equal(lifecycles.length, 2); assert.equal(f.published.length, 1); await unknown(f.current());
+        let session = 1;
+        const message = (topic, value, retained = false) => lifecycles[0].onMessage({ routeId: 'SYNTHETIC_ROUTE',
+          topic: 'external/toniebox/' + mac + '/' + topic, payload: new TextEncoder().encode(JSON.stringify(value)),
+          retained, receivedAtMs: 100, session, duplicate: false, qos: 1 });
+        message('online-state', { onlineState: 'connected' }, true);
+        message('playback/state', initial, true); await drain();
+        assert.equal(await f.current().handleGetRequest(), expected); // No live event or physical interaction.
+        assert.equal(coordinator.getDevice('SYNTHETIC_ROUTE').freshness['playback/state'], 'retained');
+        for (session = 2; session <= 4; session++) {
+          lifecycles[0].onStatus({ phase: 'connecting', connected: false }); await drain();
+          assert.equal(f.jobs.size, 1); const late = [...f.jobs][0].fn;
+          f.time += 2000;
+          lifecycles[0].onStatus({ phase: 'ready', connected: true, session }); await drain();
+          message('playback/state', initial, true); message('online-state', { onlineState: 'connected' }, true); await drain();
+          assert.equal(await f.current().handleGetRequest(), expected); assert.equal(f.jobs.size, 0);
+          late(); await drain(); assert.equal(await f.current().handleGetRequest(), expected);
+          const current = session; session--; message('playback/state', { tonie: null }); session = current; await drain();
+          assert.equal(await f.current().handleGetRequest(), expected);
+        }
+        session = 4;
+        message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true }); await drain();
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+        message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, true); await drain();
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);
+        message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
+        message('playback/state', { tonie: null }); await drain();
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.STOP);
+        message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
+        assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
+        message('online-state', { onlineState: 'disconnected' }); await drain();
+        assert.equal(await f.current().handleGetRequest(), 3);
+        message('online-state', { onlineState: 'connected' }, true); await drain();
+        assert.equal(await f.current().handleGetRequest(), 3);
+        coordinator.invalidate(); await drain(); await unavailable(f.current()); assert.equal(f.published.length, 1);
+      } finally {
+        manager.stop(); coordinator.stop();
+      }
+      assert.equal(jobs.size, 0);
     });
-    const host = new EventEmitter(); Object.assign(host, { hap, platformAccessory: PlatformAccessory,
-      publishExternalAccessories: f.api.publishExternalAccessories });
-    manager = new ProductionAccessories(host, coordinator, () => {}); managers.push(manager);
-    try {
-      coordinator.setCredentials({ username: 'SYNTHETIC', password: 'SECRET' }); coordinator.start(); await coordinator.discover(); await drain();
-      assert.equal(lifecycles.length, 2); assert.equal(f.published.length, 1); await unknown(f.current());
-      const message = (topic, value, retained = false) => lifecycles[0].onMessage({ routeId: 'SYNTHETIC_ROUTE',
-        topic: 'external/toniebox/' + mac + '/' + topic, payload: new TextEncoder().encode(JSON.stringify(value)),
-        retained, receivedAtMs: 100, session: 1, duplicate: false, qos: 1 });
-      message('online-state', { onlineState: 'connected' }, true);
-      message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, true); await drain(); await unknown(f.current());
-      message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
-      assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PLAY);
-      message('online-state', { onlineState: 'disconnected' }); await drain();
-      assert.equal(await f.current().handleGetRequest(), 3);
-      message('online-state', { onlineState: 'connected' }, true); await drain();
-      assert.equal(await f.current().handleGetRequest(), 3);
-      coordinator.invalidate(); await drain(); await unavailable(f.current()); assert.equal(f.published.length, 1);
-    } finally {
-      manager.stop(); coordinator.stop();
-    }
-    assert.equal(jobs.size, 0);
-  });
+  }
   await t.test('HAP reads reread backend state even before a deferred refresh hint is processed', async () => {
     const f = setup(); await f.refresh(); f.observation.playback = 'paused';
     assert.equal(await f.current().handleGetRequest(), C.CurrentMediaState.PAUSE);

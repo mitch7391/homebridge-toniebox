@@ -21,7 +21,7 @@ function sameValue(left: object | undefined, right: object): boolean {
     && entries.every(([key, value]) => Object.hasOwn(right, key) && value === right[key as keyof typeof right]);
 }
 
-/** Delivery order applies, except retained online state cannot supersede same-session live evidence. */
+/** Delivery order applies, except retained online/playback history cannot supersede same-session live evidence. */
 export function applyMessage(
   state: DeviceState,
   result: ParseResult,
@@ -48,9 +48,9 @@ export function applyMessage(
   }
 
   const previous = state.topics[message.topic];
-  // Once online state is observed live, retained history cannot supersede it in
+  // Once online or playback state is observed live, retained history cannot supersede it in
   // this session. Receipt time cannot establish when the retained value was published.
-  if (message.topic === 'online-state' && delivery.retained
+  if ((message.topic === 'online-state' || message.topic === 'playback/state') && delivery.retained
     && previous?.session === delivery.session && !previous.retained) {
     return unchanged;
   }
@@ -58,7 +58,9 @@ export function applyMessage(
   if (message.topic === 'online-state' && message.value.onlineState !== 'connected') {
     playbackNeedsLiveUpdate = true;
   } else if (message.topic === 'playback/state') {
-    playbackNeedsLiveUpdate = delivery.retained;
+    // Historical field name: a new accepted snapshot (including retained) clears
+    // the offline barrier. Mere connected status cannot revive pre-offline playback.
+    playbackNeedsLiveUpdate = false;
   }
   return {
     accepted: true,
@@ -91,9 +93,10 @@ function currentOnline(state: DeviceState, transport: TransportContext): boolean
 }
 
 /**
- * A current-session non-retained playback message is required, plus a connected
- * online observation in that session. Retained pairs and unrelated live topics
- * cannot establish activity. This is a conservative estimate, not a liveness guarantee.
+ * Current-session playback plus connected online evidence estimates activity.
+ * Retained snapshots bootstrap/recover state; their delivery provenance remains
+ * visible through snapshotFreshness. They are cloud snapshots, not proof of liveness.
+ * Prior sessions, missing evidence and playback invalidated by offline reports do not qualify.
  */
 export function playbackActivity(
   state: DeviceState,
@@ -101,7 +104,7 @@ export function playbackActivity(
 ): 'unknown' | 'empty' | 'paused' | 'playing' | 'inactive' {
   const snapshot = state.topics['playback/state'];
   if (!currentOnline(state, transport) || state.playbackNeedsLiveUpdate
-    || snapshotFreshness(snapshot, transport) !== 'observed' || !snapshot) {
+    || !snapshot || snapshot.session !== transport.session) {
     return 'unknown';
   }
   const value = snapshot.value;
@@ -122,6 +125,10 @@ export function playbackActivity(
 
 export function playbackPositionMs(state: DeviceState, transport: TransportContext, nowMs: number): number | undefined {
   if (!Number.isFinite(nowMs) || nowMs < 0) {
+    return undefined;
+  }
+  // Activity may use retained state, but do not extrapolate a retained chapter deadline.
+  if (snapshotFreshness(state.topics['playback/state'], transport) !== 'observed') {
     return undefined;
   }
   const activity = playbackActivity(state, transport);
