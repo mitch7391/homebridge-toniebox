@@ -17,7 +17,7 @@
 > [!IMPORTANT]
 > **This plugin is currently under development and is not ready for installation.**
 >
-> The Homebridge backend has been implemented and successfully tested against Tonies Cloud in a controlled Raspberry Pi commissioning environment. HomeKit accessories, device controls and broader reliability testing are still under development. You're welcome to follow along as the project progresses!
+> The Homebridge backend has been implemented and successfully tested against Tonies Cloud in a controlled Raspberry Pi commissioning environment. The first external read-only HomeKit SmartSpeaker has also been physically commissioned, bringing playback state into Apple Home. Further controls, broader functionality and long-term reliability testing remain under development. You're welcome to follow along as the project progresses!
 
 **Homebridge Toniebox** is an independent project aiming to bring the Toniebox into the smart home through Homebridge.
 
@@ -27,11 +27,20 @@ From managing playback and volume to checking battery levels or setting a sleep 
 
 I've started this project after experimenting with my own Toniebox 2 and discovering just how much functionality is available behind the scenes.
 
-Rather than rushing something out that only works half the time, I'm building the plugin in stages, focusing on getting the foundations right before introducing live control and HomeKit accessories.
+Rather than rushing something out that only works half the time, I'm building the plugin in stages, building on the backend and first read-only HomeKit accessory before introducing device controls.
 
 ## What Can It Do?
 
-Initial research with Toniebox 2 has demonstrated some promising capabilities:
+The Homebridge plugin currently provides:
+
+- Authorised production Toniebox discovery and backend integration.
+- MQTT device-state observation without continuous REST polling.
+- An external read-only HomeKit SmartSpeaker reporting Playing, Paused and Stopped.
+- Playback recovery using usable current-session MQTT evidence, including retained snapshots, across ordinary connection replacement and isolated Homebridge restarts.
+
+Writable playback commands, a dedicated Playback Switch, native playback scene actions, volume control, battery and charging presentation, headphone status, sleep timer controls and other device settings are not yet available as production HomeKit controls or telemetry.
+
+Separately, initial research with Toniebox 2 demonstrated these proof-of-concept capabilities:
 
 - **Playback control:** Play, pause and navigate chapters.
 - **Volume control:** Adjust the Toniebox volume remotely.
@@ -55,7 +64,7 @@ The plugin is being developed in smaller increments, with each stage tested and 
 
 The initial Homebridge platform is now in place.
 
-This includes plugin registration, configuration structure, lifecycle handling and automated testing. The platform deliberately remains inactive until the underlying integration is ready.
+This includes plugin registration, configuration structure, lifecycle handling and automated testing. At this stage, the platform deliberately remained inactive until the underlying integration was ready.
 
 ### ✅ Increment 2 - MQTT Parsing and State Management (Complete)
 
@@ -71,7 +80,7 @@ The first part of the Tonies Cloud authentication system is now implemented.
 
 A standalone authentication client supports signing in with account credentials and renewing access through refresh tokens. It includes validation of authentication responses, safe handling of token rotation, request timeouts and cancellation, and safeguards against exposing sensitive information.
 
-Importantly, this is still an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, store tokens or communicate with a Toniebox.
+At the completion of Increment 3A, this was an independent component, not yet connected to the Homebridge platform. It did not automatically sign in, persist tokens or communicate with a Toniebox.
 
 At the completion of Increment 3A, the project passed **68 automated offline tests**, including 34 new tests covering authentication.
 
@@ -83,7 +92,7 @@ An account-scoped token manager handles authentication tokens in memory, tracks 
 
 The manager also protects against overlapping authentication requests, stale responses, excessive retries and accidental exposure of sensitive information.
 
-Like Increment 3A, this remains an independent component. It is not yet connected to the Homebridge platform, does not automatically communicate with Tonies Cloud, and does not persist authentication tokens across restarts.
+Like Increment 3A, this was initially an independent component, not yet connected to Homebridge. It does not persist authentication tokens across restarts.
 
 The project now passes **140 automated offline tests**, including **72 new tests** covering token lifecycle management.
 
@@ -95,7 +104,7 @@ A standalone REST client supports retrieving account information, enumerating ho
 
 The client also identifies ambiguous device routing information, supports request timeouts and cancellation, and provides privacy-safe error handling.
 
-The REST client itself remains stateless, while the separate Increment 4B runner now combines it with token management. Neither component is connected to the Homebridge platform, so the plugin does not automatically discover devices or establish live Toniebox connectivity.
+The REST client itself remains stateless, while the separate Increment 4B runner now combines it with token management. At that stage, neither component was connected to Homebridge; automatic discovery and live connectivity followed in Increment 6C.
 
 At the completion of Increment 4A, the project passed **211 automated offline tests**, including **71 new tests** covering REST discovery.
 
@@ -109,7 +118,7 @@ Each discovery run uses a single access token, retrieves household and device in
 
 Additional safeguards protect against overlapping discovery operations, outdated responses, duplicate device identities and ambiguous routing information. Cancellation and shutdown are handled without allowing previous discovery results to affect a new account session.
 
-The discovery runner remains an independent component. It is not yet connected to the Homebridge platform, and the plugin does not automatically sign in, discover Tonieboxes, establish MQTT connections or create HomeKit accessories.
+Increment 4B delivered an independent discovery runner. Homebridge startup integration and accessory publication followed in later increments.
 
 The project now passes **331 automated offline tests**, including **120 new tests** covering discovery orchestration.
 
@@ -123,7 +132,7 @@ A standalone MQTT v5 transport supports authenticated, secure WebSocket connecti
 
 Additional safeguards protect against oversized MQTT packets before decoding, excessive payloads and uncontrolled message buffering. Automatic reconnection, resubscription and command publishing remain disabled.
 
-The transport itself remains standalone and is not connected directly to Homebridge or the token manager. Increment 5B now composes it with the token manager, while Homebridge integration remains future work.
+The transport itself remains standalone and is not connected directly to Homebridge or the token manager. Increment 5B now composes it with the token manager, with Homebridge integration subsequently added in Increment 6C.
 
 The project now passes **432 automated offline tests**, including **101 new tests** covering MQTT transport and subscriptions. Testing also passed on Linux across the supported Node.js versions.
 
@@ -139,7 +148,7 @@ Subsequent live commissioning demonstrated that Tonies Cloud could reject an est
 
 The lifecycle also manages MQTT session generations, protects against stale callbacks and messages, and handles cancellation, shutdown and connection failures conservatively. Definitive MQTT authentication refusal requires attention rather than repeatedly retrying rejected credentials.
 
-This remains an independent backend component. It is not yet connected to the Homebridge platform, and the plugin does not automatically discover Tonieboxes, establish live connections or create HomeKit accessories.
+Increment 5B delivered an independent backend component; Homebridge integration and accessory publication followed in later increments.
 
 The project now passes **571 automated offline tests**, including **139 new tests** covering MQTT lifecycle management and reconnection. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
 
@@ -157,11 +166,11 @@ Route reconciliation also protects existing connections against temporary discov
 
 A separate backend-state adapter integrates MQTT lifecycle events with the existing device-state model. It protects against stale sessions and callbacks, preserves valid state across reconnects, and exposes connection and attention-required status for future backend coordination.
 
-These components remain independent of the Homebridge platform. They do not automatically authenticate, discover devices, establish MQTT connections or create HomeKit accessories.
+Increment 6A delivered standalone components without Homebridge startup or accessory ownership.
 
 The project now passes **775 automated offline tests**, including **204 new tests** covering device routing, compatibility, reconciliation and backend-state integration. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
 
-Increment 6B will connect these standalone components through an account coordinator, followed by Homebridge platform integration in Increment 6C.
+Increment 6B subsequently connected these components through an account coordinator, followed by Homebridge platform integration in Increment 6C.
 
 ### ✅ Increment 6B - Account Coordination and Lifecycle Management (Complete)
 
@@ -177,11 +186,11 @@ Experimental Toniebox models are managed through separate connections and state 
 
 Privacy-safe diagnostics expose connection status, discovery health and conditions requiring attention without revealing account credentials, tokens or private device identifiers.
 
-The coordinator remains independent of the Homebridge platform. Discovery is explicitly requested, and no HomeKit accessories or device commands are implemented yet.
+The coordinator remains independent of Homebridge. Increment 6B itself implemented neither HomeKit accessories nor device commands; the platform subsequently took responsibility for requesting startup discovery.
 
 The project now passes **827 automated offline tests**, including **52 new tests** covering account coordination, credential transitions, discovery recovery, routing lifecycle management and experimental isolation. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
 
-This completes Increment 6B. Increment 6C will connect the standalone backend to Homebridge, including configuration, startup and shutdown handling.
+This completes Increment 6B. Increment 6C subsequently connected the standalone backend to Homebridge, including configuration, startup and shutdown handling.
 
 ### ✅ Increment 6C - Homebridge Platform Integration (Complete)
 
@@ -197,7 +206,7 @@ The integration also provides controlled shutdown, cancellation and protection a
 
 Privacy-safe operational logging reports discovery progress, connection status and conditions requiring attention. Production and experimental connectivity are reported independently to avoid misrepresenting healthy connections.
 
-Existing HomeKit accessory behaviour remains unchanged. The plugin does not yet create accessories, expose HomeKit controls or publish device commands.
+Increment 6C left existing HomeKit accessory behaviour unchanged; it did not create accessories, expose HomeKit controls or publish device commands.
 
 The project now passes **928 automated offline tests**, including **101 new tests across Increment 6C** covering discovery recovery, Homebridge startup, configuration validation, lifecycle management, cancellation, diagnostics and shutdown. Validation also passed on Linux across the supported Node.js versions and minimum runtimes.
 
@@ -271,7 +280,7 @@ GitHub Actions validation completed successfully on:
 
 The automated tests use controlled offline fixtures and mocked dependencies. The separate Raspberry Pi commissioning run provides real-world connectivity evidence.
 
-Commissioning diagnostics remain disabled in committed source, and the plugin still does not create HomeKit accessories or publish device commands.
+Commissioning diagnostics remain disabled in committed source. At the completion of Increment 7A, the plugin did not create HomeKit accessories or publish device commands.
 
 This completes Increment 7A, establishing a live-validated backend foundation for future HomeKit accessory development.
 
@@ -293,7 +302,7 @@ A separate Lightbulb-based volume slider remains a possible future enhancement, 
 
 The isolated presentation fixture passed **122 automated offline tests**. Findings from the nine scenarios and their limitations are documented in the [HomeKit Presentation Research](experiments/homekit-presentation/FINDINGS.md), separately from the synthetic [fixture and test procedures](experiments/homekit-presentation/README.md).
 
-This completes the presentation research stage, not production HomeKit integration. The plugin still does not create live Toniebox accessories or expose physical-device controls. Increment 8B.1 has since established the initial backend-to-HomeKit integration contract; accessory publication remains future work.
+This completes the presentation research stage, not production HomeKit integration. Increment 8B.1 subsequently established the backend-to-HomeKit contract, and Increment 8B.2 introduced the first read-only production accessory. The controls and additional services explored here remain planned functionality.
 
 ### ✅ Increment 8B.1 - Production HomeKit Integration Contract (Complete)
 
@@ -305,7 +314,23 @@ The integration preserves existing account and MQTT session authority, distingui
 
 Increment 8B.1 passed **1,181 automated offline tests**, including **31 new regression tests**. Validation also passed across the supported Node.js 22 and 24 runtimes.
 
-This establishes the interface required for future HomeKit accessories. The plugin does not yet publish production accessories or provide physical-device controls.
+Increment 8B.1 established the interface without publishing accessories or providing physical-device controls. Increment 8B.2 subsequently uses that contract for read-only SmartSpeaker presentation.
+
+### ✅ Increment 8B.2 - External SmartSpeaker Lifecycle and Read-Only Presentation (Complete)
+
+The first production HomeKit accessory is implemented: an externally published, read-only SmartSpeaker for authorised production Tonieboxes. Stable identities use verified account identity and normalised device MAC information, independently of display names. Experimental devices are excluded.
+
+Playing, Paused and confirmed empty playback (Stopped) are presented through HomeKit. Usable current-session retained MQTT evidence, accompanied by connected-online evidence, can initialise and recover playback without another physical interaction. Live observations take precedence over delayed retained history within the same session, and stale sessions cannot restore authority. Retained snapshots remain cloud observations, not proof of liveness.
+
+Physical offline or sustained uncertainty produces UNKNOWN/unavailable playback state rather than fabricated Paused state. A cancellable ten-second grace period preserves the last confirmed presentation during brief transport interruptions. Revocation, shutdown and late callbacks remain guarded; pairing identity is preserved for the same verified account and device. Writable commands, a Playback Switch, battery presentation, volume and other controls remain outside this increment.
+
+**Automated validation:** For implementation commit `16919285f7fb82a2ae208d0fe8b07df3454a58af`, [Validate run #92](https://github.com/mitch7391/homebridge-toniebox/actions/runs/44049453142) passed **1,257 tests in each of four jobs**: Node.js 22.x and 24.x also passed build, typecheck and lint; minimum Node.js 22.10.0 and 24.0.0 passed compiled-output tests. No failures, cancellations, skips or TODOs were reported. Independent final review found no blocking correctness defects.
+
+**Physical commissioning:** The maintainer successfully paired a real Toniebox 2 as an external SmartSpeaker in Apple Home using an isolated Raspberry Pi Homebridge instance. Playing recovered after restart in approximately four seconds; Paused recovered in approximately 2–4 seconds after playback changed while Homebridge was stopped. Live playback changes appeared within approximately two seconds, and figurine removal correctly displayed Stopped. Repeated isolated restarts preserved pairing, and production Homebridge remained unaffected.
+
+Eleven approximately four-minute connection cycles were observed, each followed by connection establishment about two seconds later, with no retry or attention-required notifications. This is consistent with proactive credential renewal, but the cause of every cycle was not individually proven. Misleading routine connection logging will be refined separately.
+
+These are maintainer observations, not CI results or exhaustive physical offline/prolonged-outage testing. Apple Home's display of UNKNOWN may vary. [PR #17](https://github.com/mitch7391/homebridge-toniebox/pull/17) records the fuller commissioning evidence and limitations. General installation and release remain unavailable.
 
 ## Roadmap
 
@@ -332,10 +357,10 @@ Here's the current plan for development:
 - [x] **Increment 8A:** HomeKit presentation research
 - [ ] **Increment 8B:** Production HomeKit architecture discovery and accessory integration
   - [x] **8B.1:** Production device inventory and change notifications
-  - [ ] **8B.2:** External SmartSpeaker lifecycle and read-only presentation
+  - [x] **8B.2:** External SmartSpeaker lifecycle and read-only presentation
 - [ ] **Future:** Beta testing and refinement
 
-The roadmap is subject to change as development progresses.
+Increment 8B remains incomplete. Planned work includes playback controls, a dedicated Playback Switch, battery telemetry, volume functionality, logging refinement, plugin settings and configuration UI improvements. The roadmap is subject to change as development progresses.
 
 ## How Will It Work?
 
@@ -343,7 +368,7 @@ One of the most exciting discoveries during the initial research was that Tonieb
 
 That gives us the opportunity to build something much more responsive and efficient.
 
-The planned integration combines:
+The broader planned integration combines the following; commands and settings writes are not implemented by the current read-only plugin:
 
 - **MQTT** for live device state and commands.
 - **REST / GraphQL** for discovering devices, retrieving metadata and changing persistent settings.
@@ -370,7 +395,7 @@ The project currently declares support for the following environments:
 
 Node.js 24 is recommended for development. Node.js 22.13.0 or newer is needed for the current ESLint development tooling.
 
-The backend has been validated in an isolated Raspberry Pi Homebridge environment. General installation compatibility, HomeKit accessory behaviour and longer-term unattended operation remain to be validated.
+The backend and read-only SmartSpeaker have been physically commissioned with a real Toniebox 2 in an isolated Raspberry Pi environment using Homebridge 2.4.0 and HAP-NodeJS 2.2.2. General installation compatibility, broader HomeKit functionality and long-term unattended reliability remain under development. This does not expand the declared compatibility ranges or establish physical validation across every supported Homebridge version.
 
 ### Building from source
 
@@ -392,7 +417,7 @@ Automated GitHub Actions workflows validate the project across Node.js 22 and 24
 
 Automated tests run offline using synthetic data, controlled fixtures and mocked Homebridge interfaces. No Toniebox hardware, Tonies account or live MQTT connection is required to execute the test suite.
 
-Separate manual commissioning has also validated the backend against a real Toniebox 2 and Tonies Cloud, as documented in Increment 7A. These results should not be confused with the automated GitHub Actions tests.
+Separate manual commissioning validated the backend against a real Toniebox 2 and Tonies Cloud in Increment 7A, followed by read-only SmartSpeaker presentation in Increment 8B.2. These results should not be confused with the automated GitHub Actions tests.
 
 ### Technical Documentation
 

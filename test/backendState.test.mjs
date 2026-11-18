@@ -160,11 +160,11 @@ test('messages before readiness cannot mutate initial state', () => {
   assert.equal(f.binding.onMessage(message()).accepted, false);
   assert.deepEqual(f.get().state.topics, {});
 });
-test('retained online and playback alone never establish playing', () => {
+test('retained online and playback bootstrap playing with honest retained freshness', () => {
   const f = fixture(); f.binding.onStatus(ready(1));
   f.binding.onMessage(message('online-state', { onlineState: 'connected' }, { retained: true }));
   f.binding.onMessage(message('playback/state', playing, { retained: true }));
-  assert.equal(f.get().playback, 'unknown');
+  assert.equal(f.get().playback, 'playing');
   assert.equal(f.get().freshness['playback/state'], 'retained');
   f.binding.onMessage(message('playback/state', playing));
   assert.equal(f.get().playback, 'playing');
@@ -176,13 +176,12 @@ test('same-session live online state outranks retained historical online', () =>
   assert.equal(f.get().playback, 'playing');
   assert.equal(f.get().state.topics['online-state'].value.onlineState, 'connected');
 });
-test('accepted semantic duplicate changes freshness and can revoke playing', () => {
+test('retained duplicate cannot relabel newer live playback or notify observers', () => {
   const f = fixture(); active(f);
+  const before = f.get(), n = f.notices.length;
   const result = f.binding.onMessage(message('playback/state', playing, { retained: true, duplicate: true, receivedAtMs: 100001 }));
-  assert.deepEqual(result, { accepted: true, changed: false });
-  assert.equal(f.get().state.topics['playback/state'].receivedAtMs, 100001);
-  assert.equal(f.get().playback, 'unknown');
-  assert.deepEqual(f.notices.at(-1), { kind: 'message', changed: false });
+  assert.deepEqual(result, { accepted: false, reason: 'ignored-history' });
+  assert.deepEqual(f.get(), before); assert.equal(f.get().playback, 'playing'); assert.equal(f.notices.length, n);
 });
 test('unknown online values remain observations, not fabricated offline enums', () => {
   const f = fixture(); active(f);

@@ -1,16 +1,19 @@
+import { ProductionAccessories } from './productionAccessories.js';
 import type { API, DynamicPlatformPlugin, Logging, PlatformConfig } from 'homebridge';
 import { PlatformRuntime } from './platformRuntime.js';
 import type { PlatformRuntimeOptions } from './platformRuntime.js';
 
-/** Thin lifecycle adapter. Accessory support remains intentionally absent. */
+/** Thin lifecycle adapter; production external presentation has separate ownership. */
 export class TonieboxPlatform implements DynamicPlatformPlugin {
   constructor(log: Logging, config: PlatformConfig, api: API, options: PlatformRuntimeOptions = {}) {
-    const runtime = new PlatformRuntime(config, log, options);
+    const runtime = new PlatformRuntime(config, log, { ...options,
+      presentationFactory: options.presentationFactory ?? (reader => new ProductionAccessories(api, reader, message => log.warn(message))),
+    });
     api.on('didFinishLaunching', () => runtime.launch());
     api.on('shutdown', () => runtime.stop());
   }
 
   configureAccessory(): void {
-    // Leave restored accessories unchanged until accessory support is designed.
+    // External accessories are rediscovered, not restored through this bridged-cache callback. Leave cached accessories untouched.
   }
 }
