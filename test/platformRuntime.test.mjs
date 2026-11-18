@@ -38,18 +38,20 @@ async function drain() {
   }
 }
 function fixture(options = {}) {
-  const f = { time: 0, jobs: new Set(), history: [], calls: [], logs: [], result: complete };
+  const f = { time: 0, jobs: new Set(), history: [], calls: [], logs: [], levels: [], result: complete };
   const schedule = (fn, ms) => {
     const job = { fn, ms }; f.jobs.add(job); f.history.push(job);
     return () => {
       f.jobs.delete(job); options.cancel?.();
     };
   };
-  const logger = { info: message => {
-    f.logs.push(message); return options.log?.(f);
+  const logger = { debug: message => {
+    f.levels.push(['debug', message]); return options.debug?.(f);
+  }, info: message => {
+    f.levels.push(['info', message]); f.logs.push(message); return options.log?.(f);
   },
   warn: message => {
-    f.logs.push(message); return options.log?.(f);
+    f.levels.push(['warn', message]); f.logs.push(message); return options.log?.(f);
   } };
   const factory = status => {
     f.calls.push('create'); f.status = status; options.factory?.(f);
@@ -320,4 +322,119 @@ test('commissioning build activation wires bounded observer and suppresses late 
   assert.match(logs.join(),/commissioning diagnostics active/); assert.match(logs.join(),/established/);
   runtime.stop(); const n=logs.length; fake.observer({ kind:'session',lane:'production',established:2 });
   assert.equal(logs.length,n); assert.deepEqual(fake.calls,['create','credentials','start','discover','stop']);
+});
+
+const productionStatus = status => ({ phase: 'connected', connections: [{ lane: 'production', status }] });
+const readyStatus = (session, replacement) => ({ phase: 'ready', connected: true, session, ...(replacement ? { replacement } : {}) });
+const rotatingStatus = { phase: 'connecting', connected: false, replacement: 'proactive' };
+const productionLogs = f => f.levels.filter(([, message]) => message.includes('production'));
+
+test('healthy credential rotations log DEBUG only after initial INFO, including duplicates and old ready', async () => {
+  const f = fixture(); f.runtime.launch(); await drain();
+  f.status(productionStatus({ phase: 'connecting', connected: false }));
+  f.status(productionStatus(readyStatus(1))); f.status(productionStatus(readyStatus(1)));
+  assert.deepEqual(productionLogs(f), [['info', 'Toniebox production connection established.']]);
+  for (let session = 2; session <= 5; session++) {
+    f.time += 240000;
+    f.status(productionStatus(rotatingStatus)); f.status(productionStatus(rotatingStatus));
+    f.status(productionStatus(readyStatus(session - 1, 'proactive')));
+    assert.equal(productionLogs(f).at(-1)[1], 'Toniebox production connection replacing credentials.');
+    f.status(productionStatus(readyStatus(session, 'proactive')));
+    f.status(productionStatus(readyStatus(session, 'proactive')));
+  }
+  assert.equal(productionLogs(f).filter(([level]) => level === 'info').length, 1);
+  assert.equal(productionLogs(f).filter(([level]) => level === 'warn').length, 0);
+  assert.equal(productionLogs(f).filter(([level]) => level === 'debug').length, 8);
+  assert.equal(productionLogs(f).at(-1)[1], 'Toniebox production credential replacement complete.');
+  assert.equal(f.jobs.size, 0); assert.equal(f.calls.filter(x => x === 'discover').length, 1);
+});
+
+for (const failure of ['waiting-retry', 'attention-required', 'idle', 'absent']) {
+  test('failed or abandoned proactive replacement stays visible: ' + failure, async () => {
+    const f = fixture(); f.runtime.launch(); await drain(); f.status(productionStatus(readyStatus(1)));
+    f.time = 240000; f.status(productionStatus(rotatingStatus));
+    f.status(failure === 'absent' ? { phase: 'idle', connections: [] } : productionStatus({ phase: failure,
+      connected: false, replacement: 'proactive', error: { kind: 'authentication-refused' } }));
+    const expected = failure === 'waiting-retry' ? 'retrying' : failure === 'attention-required' ? 'requires attention' : 'interrupted';
+    assert.deepEqual(productionLogs(f).at(-1), ['warn', 'Toniebox production connection ' + expected + '.']);
+    f.status(productionStatus(readyStatus(2, 'proactive')));
+    assert.deepEqual(productionLogs(f).at(-1), ['info', 'Toniebox production connection established.']);
+    assert.ok(!productionLogs(f).some(([, m]) => m.includes('replacement complete')));
+  });
+}
+for (const replacement of [undefined, null, {}, 'unknown', 'recovery']) {
+  test('missing or non-proactive metadata cannot hide an interruption: ' + JSON.stringify(replacement), async () => {
+    const f = fixture(); f.runtime.launch(); await drain(); f.status(productionStatus(readyStatus(1)));
+    f.time = 240000; f.status(productionStatus({ phase: 'connecting', connected: false, replacement }));
+    assert.deepEqual(productionLogs(f).at(-1), ['warn', 'Toniebox production connection interrupted.']);
+    f.status(productionStatus(readyStatus(2, replacement)));
+    assert.deepEqual(productionLogs(f).at(-1), ['info', 'Toniebox production connection established.']);
+    assert.ok(!productionLogs(f).some(([level]) => level === 'debug'));
+  });
+}
+test('proactive-labelled initial ready is INFO and malformed connecting evidence is not maintenance', async () => {
+  const f = fixture(); f.runtime.launch(); await drain();
+  f.status(productionStatus(rotatingStatus)); f.status(productionStatus(readyStatus(1, 'proactive')));
+  assert.deepEqual(productionLogs(f), [['info', 'Toniebox production connection established.']]);
+  f.time = 240000;
+  f.status(productionStatus({ ...rotatingStatus, error: { kind: 'timeout', private: 'SYNTHETIC_SECRET' } }));
+  assert.deepEqual(productionLogs(f).at(-1), ['warn', 'Toniebox production connection interrupted.']);
+  assert.doesNotMatch(JSON.stringify(f.levels), /SYNTHETIC/);
+});
+test('experimental and account attention remain visible during maintenance', async () => {
+  const f = fixture(); f.runtime.launch(); await drain(); f.status(productionStatus(readyStatus(1)));
+  f.time = 240000;
+  f.status({ phase: 'attention-required', connections: [...productionStatus(rotatingStatus).connections,
+    { lane: 'experimental', status: { phase: 'attention-required', connected: false } }] });
+  assert.ok(f.levels.some(([level, m]) => level === 'warn' && m.includes('experimental connectivity requires attention')));
+  f.status({ phase: 'attention-required', reason: 'authentication', connections: [] });
+  assert.ok(f.levels.some(([level, m]) => level === 'warn' && m === 'Toniebox authentication requires attention.'));
+});
+for (const mode of ['throw', 'reject', 'stop', 'reenter']) {
+  test('DEBUG observer containment and terminal shutdown: ' + mode, async () => {
+    let acted = false;
+    const f = fixture({ debug: value => {
+      if (acted) {
+        return;
+      }
+      acted = true;
+      if (mode === 'throw') {
+        throw new Error('SYNTHETIC_SECRET');
+      }
+      if (mode === 'reject') {
+        return Promise.reject(new Error('SYNTHETIC_SECRET'));
+      }
+      if (mode === 'stop') {
+        value.runtime.stop();
+      }
+      if (mode === 'reenter') {
+        value.status(productionStatus(readyStatus(2, 'proactive')));
+      }
+    } });
+    f.runtime.launch(); await drain(); f.status(productionStatus(readyStatus(1)));
+    f.time = 240000; f.status(productionStatus(rotatingStatus));
+    f.status(productionStatus(readyStatus(2, 'proactive'))); await drain();
+    if (mode === 'stop') {
+      assert.ok(!productionLogs(f).some(([, m]) => m.includes('replacement complete')));
+    } else {
+      assert.equal(productionLogs(f).filter(([, m]) => m.includes('replacement complete')).length, 1);
+    }
+    f.runtime.stop(); const count = f.levels.length;
+    f.status(productionStatus(rotatingStatus)); f.status(productionStatus(readyStatus(3, 'proactive'))); await drain();
+    assert.equal(f.levels.length, count); assert.equal(f.calls.filter(x => x === 'stop').length, 1);
+    assert.equal(f.jobs.size, 0); assert.doesNotMatch(JSON.stringify(f.levels), /SYNTHETIC/);
+  });
+}
+
+test('rapid maintenance notices retain the existing per-message throttle without timers', async () => {
+  const f = fixture(); f.runtime.launch(); await drain(); f.status(productionStatus(readyStatus(1)));
+  for (let session = 2; session <= 10; session++) {
+    f.status(productionStatus(rotatingStatus)); f.status(productionStatus(readyStatus(session, 'proactive')));
+  }
+  assert.equal(productionLogs(f).filter(([level]) => level === 'debug').length, 2);
+  f.time = 60000;
+  f.status(productionStatus(rotatingStatus)); f.status(productionStatus(readyStatus(11, 'proactive')));
+  assert.equal(productionLogs(f).filter(([level]) => level === 'debug').length, 4);
+  assert.equal(productionLogs(f).filter(([level]) => level === 'info').length, 1);
+  assert.equal(f.jobs.size, 0);
 });

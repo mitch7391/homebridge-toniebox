@@ -13,6 +13,7 @@ export interface PlatformRuntimeOptions {
   readonly jitter?: () => number;
 }
 export interface RuntimeLogger {
+  debug?(message: string): void;
   info(message: string): void;
   warn(message: string): void;
 }
@@ -28,6 +29,8 @@ const messages = {
   permission: 'Toniebox discovery permission requires attention.',
   attention: 'Toniebox backend requires attention; automatic discovery paused.',
   connected: 'Toniebox production connection established.',
+  rotationStarted: 'Toniebox production connection replacing credentials.',
+  rotationCompleted: 'Toniebox production credential replacement complete.',
   reconnecting: 'Toniebox production connection retrying.',
   interrupted: 'Toniebox production connection interrupted.',
   productionAttention: 'Toniebox production connection requires attention.',
@@ -64,6 +67,9 @@ export class PlatformRuntime {
   #alarm?: Alarm;
   #retry = 0;
   #lastTime = 0;
+  // Logging correlation only; never owns MQTT attempts or session authority.
+  #readySession?: number;
+  #rotationSession?: number;
   #lastNotice = new Map<string, Notice>();
   #logged = new Map<Notice, number>();
 
@@ -107,8 +113,9 @@ export class PlatformRuntime {
     }
     this.#logged.set(key, now);
     try {
-      const returned: unknown = ['starting', 'missing', 'complete', 'connected', 'shutdown'].includes(key)
-        ? this.#log.info(messages[key]) : this.#log.warn(messages[key]);
+      const returned: unknown = key === 'rotationStarted' || key === 'rotationCompleted'
+        ? this.#log.debug?.(messages[key]) : ['starting', 'missing', 'complete', 'connected', 'shutdown'].includes(key)
+          ? this.#log.info(messages[key]) : this.#log.warn(messages[key]);
       void Promise.resolve(returned).catch(() => undefined);
     } catch { /* Logger failures do not change runtime ownership. */ }
   }
@@ -123,14 +130,31 @@ export class PlatformRuntime {
     }
     try {
       const production = raw.connections.find(c => c.lane === 'production');
-      if (production?.status.connected && production.status.phase === 'ready') {
-        this.#notice('connected', 'production');
-      } else if (production?.status.phase === 'waiting-retry') {
-        this.#notice('reconnecting', 'production');
-      } else if (production?.status.phase === 'attention-required') {
-        this.#notice('productionAttention', 'production');
-      } else if (production && this.#lastNotice.has('production')) {
-        this.#notice('interrupted', 'production');
+      const status = production?.status;
+      const proactive = status?.replacement === 'proactive' && status.error === undefined;
+      if (status?.connected === true && status.phase === 'ready') {
+        // A repeated old ready notification cannot complete an in-flight replacement.
+        if (this.#rotationSession === undefined || (Number.isSafeInteger(status.session) && status.session! > this.#rotationSession)) {
+          const completed = this.#rotationSession !== undefined && proactive;
+          this.#rotationSession = undefined;
+          this.#readySession = Number.isSafeInteger(status.session) && status.session! > 0 ? status.session : undefined;
+          this.#notice(completed ? 'rotationCompleted' : 'connected', completed ? 'rotation' : 'production');
+        }
+      } else if (status?.phase === 'connecting' && status.connected === false && status.session === undefined
+        && proactive && this.#readySession !== undefined && this.#lastNotice.get('production') === 'connected') {
+        this.#rotationSession = this.#readySession;
+        this.#notice('rotationStarted', 'rotation');
+      } else {
+        const abandoned = this.#rotationSession !== undefined;
+        this.#rotationSession = undefined; this.#readySession = undefined;
+        this.#lastNotice.delete('rotation');
+        if (status?.phase === 'waiting-retry') {
+          this.#notice('reconnecting', 'production');
+        } else if (status?.phase === 'attention-required') {
+          this.#notice('productionAttention', 'production');
+        } else if ((production && this.#lastNotice.has('production')) || abandoned) {
+          this.#notice('interrupted', 'production');
+        }
       }
       if (this.#stopped) {
         return;
@@ -327,6 +351,7 @@ export class PlatformRuntime {
       return;
     }
     this.#stopped = true;
+    this.#rotationSession = undefined; this.#readySession = undefined;
     const alarm = this.#alarm, flight = this.#flight, coordinator = this.#coordinator;
     this.#alarm = undefined; this.#flight = undefined; this.#coordinator = undefined; this.#credentials = undefined;
     const presentation = this.#presentation; this.#presentation = undefined;
