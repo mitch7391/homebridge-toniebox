@@ -328,7 +328,9 @@ Physical offline or sustained uncertainty produces UNKNOWN/unavailable playback 
 
 **Physical commissioning:** The maintainer successfully paired a real Toniebox 2 as an external SmartSpeaker in Apple Home using an isolated Raspberry Pi Homebridge instance. Playing recovered after restart in approximately four seconds; Paused recovered in approximately 2–4 seconds after playback changed while Homebridge was stopped. Live playback changes appeared within approximately two seconds, and figurine removal correctly displayed Stopped. Repeated isolated restarts preserved pairing, and production Homebridge remained unaffected.
 
-Eleven approximately four-minute connection cycles were observed, each followed by connection establishment about two seconds later, with no retry or attention-required notifications. This is consistent with proactive credential renewal, but the cause of every cycle was not individually proven. Misleading routine connection logging will be refined separately.
+Eleven approximately four-minute connection cycles were originally observed, each followed by connection establishment about two seconds later, without retry or attention-required notifications. A subsequent [MQTT logging refinement (PR #18)](https://github.com/mitch7391/homebridge-toniebox/pull/18) corrected the misclassification of healthy proactive credential replacements as connection interruptions. Physical commissioning on 18 November 2026 confirmed three consecutive successful credential replacements, each completing in approximately two seconds. Routine replacements now produce DEBUG diagnostics rather than misleading WARN and repeated INFO messages.
+
+An additional startup observation remains under investigation: when powering on a previously offline Toniebox, physical playback began after approximately four seconds, while Apple Home reported Playing approximately 20–23 seconds after power-on. Restarting the Home app early did not shorten this delay. Once the Toniebox was online, playback changes continued to update within approximately two seconds. The cause of the startup reporting delay has not yet been established.
 
 These are maintainer observations, not CI results or exhaustive physical offline/prolonged-outage testing. Apple Home's display of UNKNOWN may vary. [PR #17](https://github.com/mitch7391/homebridge-toniebox/pull/17) records the fuller commissioning evidence and limitations. General installation and release remain unavailable.
 
@@ -360,7 +362,7 @@ Here's the current plan for development:
   - [x] **8B.2:** External SmartSpeaker lifecycle and read-only presentation
 - [ ] **Future:** Beta testing and refinement
 
-Increment 8B remains incomplete. Planned work includes playback controls, a dedicated Playback Switch, battery telemetry, volume functionality, logging refinement, plugin settings and configuration UI improvements. The roadmap is subject to change as development progresses.
+Increment 8B remains incomplete. Planned work includes playback controls, a dedicated Playback Switch, battery telemetry, volume functionality, investigation of startup playback-state reporting latency, plugin settings and configuration UI improvements. The roadmap is subject to change as development progresses.
 
 ## How Will It Work?
 
