@@ -40,6 +40,8 @@ The Homebridge plugin currently provides:
 
 Writable playback commands, a dedicated Playback Switch, native playback scene actions, volume control, battery and charging presentation, headphone status, sleep timer controls and other device settings are not yet available as production HomeKit controls or telemetry.
 
+Increment 8B.3A adds a guarded MQTT playback-command publishing transport, but it remains disabled by default and is not yet connected to the production lifecycle, account coordinator or HomeKit controls.
+
 Separately, initial research with Toniebox 2 demonstrated these proof-of-concept capabilities:
 
 - **Playback control:** Play, pause and navigate chapters.
@@ -334,6 +336,24 @@ An additional startup observation remains under investigation: when powering on 
 
 These are maintainer observations, not CI results or exhaustive physical offline/prolonged-outage testing. Apple Home's display of UNKNOWN may vary. [PR #17](https://github.com/mitch7391/homebridge-toniebox/pull/17) records the fuller commissioning evidence and limitations. General installation and release remain unavailable.
 
+### ✅ Increment 8B.3A - Guarded MQTT Playback Publishing (Complete)
+
+The first stage of production playback-control development is now implemented.
+
+The existing MQTT v5 transport supports guarded publishing of the physically researched Play/Resume and Pause commands. It constructs fixed Toniebox playback-command topics and payloads internally, uses QoS 1 without retained publishing, and requires explicit route-level permission. Command publishing is disabled by default.
+
+Publishing is limited to an established, ready connection and one outstanding operation per transport. A three-second acknowledgement deadline, cancellation, connection-closure handling and reentrancy protections prevent abandoned or outdated operations from remaining active.
+
+MQTT v5 PUBACK handling correlates outgoing publications with their actual broker acknowledgements, including rejection and reason code 16 (No matching subscribers). A successful MQTT.js publish callback alone is not treated as sufficient acknowledgement. Results and diagnostics avoid exposing credentials, private device identifiers, topics or command payloads.
+
+A broker acknowledgement does not prove that the Toniebox executed the requested action. Cancellation cannot retract an already transmitted command, and MQTT QoS 1 does not guarantee exactly-once physical execution. Broker-side delayed delivery and MQTT v5 message expiry remain considerations before physical command commissioning.
+
+**Validation:** The final implementation passed **166 focused MQTT transport tests** and **1,335 automated offline tests** overall, together with ESLint, TypeScript typechecking and the production build. [GitHub Actions validation](https://github.com/mitch7391/homebridge-toniebox/actions/runs/45369353122) passed all four jobs across Node.js 22.x, 24.x and both minimum supported runtimes. The implementation also completed independent static review without identified blocking defects.
+
+The changes are limited to the MQTT transport, its public types and transport regression tests. Existing receive-only subscriptions, authentication, connection lifecycle, account coordination and HomeKit behaviour remain unchanged.
+
+This increment provides transport infrastructure only. No playback commands have been sent to the physical Toniebox using this implementation. Increment 8B.3B will introduce authorised command coordination and fresh physical-state confirmation, followed by writable HomeKit controls in Increment 8B.3C.
+
 ## Roadmap
 
 Here's the current plan for development:
@@ -360,9 +380,13 @@ Here's the current plan for development:
 - [ ] **Increment 8B:** Production HomeKit architecture discovery and accessory integration
   - [x] **8B.1:** Production device inventory and change notifications
   - [x] **8B.2:** External SmartSpeaker lifecycle and read-only presentation
+  - [ ] **8B.3:** Authorised playback control and HomeKit integration
+    - [x] **8B.3A:** Guarded MQTT playback publishing transport
+    - [ ] **8B.3B:** Authorised command coordination and physical-state confirmation
+    - [ ] **8B.3C:** Writable SmartSpeaker playback actions and Playback Switch
 - [ ] **Future:** Beta testing and refinement
 
-Increment 8B remains incomplete. Planned work includes playback controls, a dedicated Playback Switch, battery telemetry, volume functionality, investigation of startup playback-state reporting latency, plugin settings and configuration UI improvements. The roadmap is subject to change as development progresses.
+Increment 8B remains incomplete. Guarded playback-command publishing is implemented but not yet connected to operational device controls. Remaining work includes authorised command coordination, physical-state confirmation, writable HomeKit playback actions, a dedicated Playback Switch, battery telemetry, volume functionality, investigation of startup playback-state reporting latency, plugin settings and configuration UI improvements. The roadmap is subject to change as development progresses.
 
 ## How Will It Work?
 
@@ -370,7 +394,7 @@ One of the most exciting discoveries during the initial research was that Tonieb
 
 That gives us the opportunity to build something much more responsive and efficient.
 
-The broader planned integration combines the following; commands and settings writes are not implemented by the current read-only plugin:
+The broader planned integration combines the following. Although a guarded MQTT playback-command transport now exists, it remains disabled by default and is not connected to operational HomeKit controls. Settings writes are also not yet implemented:
 
 - **MQTT** for live device state and commands.
 - **REST / GraphQL** for discovering devices, retrieving metadata and changing persistent settings.
