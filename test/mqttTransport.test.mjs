@@ -106,9 +106,9 @@ function fixture(t, extras = {}) {
     },
   };
 }
-test('construction is inert and exposes no publishing or session API', t => {
+test('construction is inert and exposes only the guarded playback publishing API', t => {
   const f = fixture(t);
-  assert.deepEqual(Object.keys(f.transport).sort(), ['close', 'connect', 'getStatus']);
+  assert.deepEqual(Object.keys(f.transport).sort(), ['close', 'connect', 'getStatus', 'publishPlayback']);
   assert.equal(f.client, undefined);
   assert.equal(f.jobs.size, 0);
 });
@@ -723,13 +723,14 @@ test('tracing enabled after construction but before connect is rejected without 
   }
 });
 
-function realFixture(t, response) {
+function realFixture(t, response, extras = {}) {
   const socket = new SyntheticSocket();
   const raw = createWebSocketStream(socket);
   const messages = [];
   const controller = new AbortController();
   let builtClient;
   const adapter = createMqttTransport({
+    ...extras,
     onMessage: m => messages.push(m),
     streamFactory: () => raw,
     clientFactory: (builder, options) => {
@@ -759,7 +760,7 @@ function realFixture(t, response) {
     get client() {
       return builtClient;
     },
-    start: () => adapter.connect(credentials, routes, { signal: controller.signal }),
+    start: (options = {}) => adapter.connect(credentials, routes, { signal: controller.signal, ...options }),
   };
 }
 const acceptSubscriptions = (socket, p) => queueMicrotask(() => socket.receive({
@@ -1019,4 +1020,462 @@ test('real manager + lifecycle + guarded MQTT.js/ws sustain rotation and bounded
     assert.equal(s.socket.sent.find(p => p.cmd === 'subscribe').subscriptions.length, 7);
     assert.equal(s.socket.sent.some(p => p.cmd === 'publish'), false);
   }
+});
+
+// Playback tests use explicit transport permission; existing connection callers remain receive-only.
+async function playbackFixture(t, permission = [routes[0].routeId], extras = {}) {
+  const f = fixture(t, extras);
+  const starting = f.transport.connect(credentials, routes, { playbackRouteIds: permission });
+  f.connected(); f.client.connected = true; f.ack(); assert.equal((await starting).ok, true);
+  const sent = [], removed = [];
+  let id = 100;
+  f.client.publish = (name, payload, options, callback) => {
+    const packet = { cmd: 'publish', topic: name, payload, ...options, messageId: id++ };
+    const operation = { packet, callback }; sent.push(operation);
+    f.client.emit('packetsend', packet);
+    return f.client;
+  };
+  f.client.removeOutgoingMessage = messageId => {
+    removed.push(messageId);
+    sent.find(o => o.packet.messageId === messageId)?.callback(new Error('SYNTHETIC_PRIVATE'));
+    return f.client;
+  };
+  t.after(() => {
+    for (const event of ['packetsend', 'packetreceive']) {
+      assert.equal(f.client.listenerCount(event), 0);
+    }
+  });
+  return { ...f, client: f.client, sent, removed,
+    publish: (action = 'play', options) => f.transport.publishPlayback(routes[0].routeId, action, options),
+    ackPublish(code = 0, index = sent.length - 1) {
+      const o = sent[index];
+      f.client.emit('packetreceive', { cmd: 'puback', messageId: o.packet.messageId, reasonCode: code });
+      o.callback(code > 0 && code !== 16 ? new Error('SYNTHETIC_PRIVATE') : null, o.packet);
+    },
+  };
+}
+const publishFailed = (reason, delivery = 'not-dispatched') => ({ ok: false, reason, delivery });
+const brokerAccepted = { ok: true, acknowledgement: 'broker' };
+
+test('playback disabled by default; authorised subscription is not command permission', async t => {
+  const g = await playbackFixture(t, []);
+  assert.deepEqual(await g.publish(), publishFailed('not-authorised'));
+  assert.equal(g.sent.length, 0);
+  const h = fixture(t); const start = h.start(); h.connected(); h.client.connected = true; h.ack(); await start;
+  assert.deepEqual(await h.transport.publishPlayback(routes[0].routeId, 'play'), publishFailed('not-authorised'));
+});
+for (const permission of [null, {}, 'SYNTHETIC_ROUTE', ['UNKNOWN'], ['SYNTHETIC_ROUTE', 'SYNTHETIC_ROUTE'], [3], ['']]) {
+  test('invalid playback permission fails before creating a client: ' + JSON.stringify(permission), async t => {
+    const f = fixture(t);
+    assert.equal((await f.transport.connect(credentials, routes, { playbackRouteIds: permission })).error.kind, 'invalid-input');
+    assert.equal(f.client, undefined);
+  });
+}
+test('throwing permission and request properties are contained without private errors', async t => {
+  const f = fixture(t);
+  assert.equal((await f.transport.connect(credentials, routes, { get playbackRouteIds() {
+    throw new Error('SYNTHETIC_PRIVATE');
+  } })).ok, false);
+  const g = await playbackFixture(t);
+  assert.deepEqual(await g.publish('play', { get signal() {
+    throw new Error('SYNTHETIC_PRIVATE');
+  } }), publishFailed('invalid-input'));
+  assert.equal(g.sent.length, 0);
+});
+test('invalid playback actions, routes and signals cannot publish', async t => {
+  const f = await playbackFixture(t);
+  for (const action of ['stop', '', 0, true, null, {}, 'SYNTHETIC_PRIVATE']) {
+    assert.deepEqual(await f.publish(action), publishFailed('invalid-input'));
+  }
+  for (const options of [null, [], false, { signal: {} }, { signal: false }]) {
+    assert.deepEqual(await f.publish('play', options), publishFailed('invalid-input'));
+  }
+  assert.deepEqual(await f.transport.publishPlayback('UNKNOWN', 'play'), publishFailed('not-authorised'));
+  assert.equal(f.sent.length, 0);
+});
+test('idle, connecting, disconnected-client and closed publishing reject', async t => {
+  const f = fixture(t);
+  assert.deepEqual(await f.transport.publishPlayback(routes[0].routeId, 'play'), publishFailed('not-ready'));
+  const start = f.start();
+  assert.deepEqual(await f.transport.publishPlayback(routes[0].routeId, 'play'), publishFailed('not-ready'));
+  f.transport.close(); await start;
+  assert.deepEqual(await f.transport.publishPlayback(routes[0].routeId, 'play'), publishFailed('closed'));
+  const g = await playbackFixture(t); g.client.connected = false;
+  assert.deepEqual(await g.publish(), publishFailed('not-ready')); assert.equal(g.sent.length, 0);
+});
+for (const action of ['play', 'pause']) {
+  test('exact guarded wire request: ' + action, async t => {
+    const f = await playbackFixture(t); const result = f.publish(action);
+    assert.deepEqual(f.sent[0].packet, { cmd: 'publish', topic: 'external/toniebox/SYNTHETIC-MAC/app-control/playback',
+      payload: action === 'play' ? '{"action":"start"}' : '{"action":"pause"}', qos: 1, retain: false, messageId: 100 });
+    assert.equal(Object.keys(f.client.request).length, 7);
+    f.ackPublish(); assert.deepEqual(await result, brokerAccepted); assert.equal(f.jobs.size, 0);
+  });
+}
+test('connection inputs and permission arrays are detached before asynchronous admission', async t => {
+  const f = fixture(t), r = [{ ...routes[0] }], permissions = [r[0].routeId];
+  const start = f.transport.connect(credentials, r, { playbackRouteIds: permissions });
+  r[0].macAddress = 'OTHER'; r[0].routeId = 'OTHER'; permissions[0] = 'OTHER';
+  f.connected(); f.client.connected = true; f.ack(); await start;
+  let sent;
+  f.client.publish = (name, payload, options, cb) => {
+    sent = name; f.client.emit('packetsend', { cmd: 'publish', topic: name, payload, ...options, messageId: 20 });
+    f.client.emit('packetreceive', { cmd: 'puback', messageId: 20 }); cb(null); return f.client;
+  };
+  assert.deepEqual(await f.transport.publishPlayback(routes[0].routeId, 'play'), brokerAccepted);
+  assert.equal(sent, 'external/toniebox/SYNTHETIC-MAC/app-control/playback');
+  assert.deepEqual(await f.transport.publishPlayback('OTHER', 'play'), publishFailed('not-authorised'));
+});
+for (const [code, reason] of [[0, undefined], [16, 'no-subscribers'], [135, 'broker-refused'], [151, 'broker-refused']]) {
+  test('PUBACK classification ' + code, async t => {
+    const f = await playbackFixture(t), p = f.publish(); f.ackPublish(code);
+    assert.deepEqual(await p, reason ? publishFailed(reason, 'uncertain') : brokerAccepted);
+    assert.equal(f.transport.getStatus().phase, 'ready');
+  });
+}
+for (const reasonCode of [1, 255, -1, NaN, 0.5, '0', null]) {
+  test('malformed PUBACK reason rejected: ' + String(reasonCode), async t => {
+    const f = await playbackFixture(t), p = f.publish();
+    f.client.emit('packetreceive', { cmd: 'puback', messageId: 100, reasonCode });
+    assert.deepEqual(await p, publishFailed('invalid-acknowledgement', 'uncertain'));
+    assert.equal(f.jobs.size, 0);
+  });
+}
+test('callback alone and wrong-id ACK cannot claim acceptance; missing ACK times out', async t => {
+  const f = await playbackFixture(t), p = f.publish(); let settled = false; void p.then(() => {
+    settled = true;
+  });
+  f.sent[0].callback(null); f.client.emit('packetreceive', { cmd: 'puback', messageId: 101, reasonCode: 0 });
+  await nextTurn(); assert.equal(settled, false); f.advance(2999); await nextTurn(); assert.equal(settled, false);
+  f.advance(1); assert.deepEqual(await p, publishFailed('timeout', 'uncertain')); assert.deepEqual(f.removed, [100]);
+});
+test('callback before matching ACK waits; duplicate ACK/callback cannot settle twice', async t => {
+  const f = await playbackFixture(t), p = f.publish(); let count = 0; void p.then(() => {
+    count++;
+  });
+  f.sent[0].callback(null); f.ackPublish(); f.ackPublish(135); f.sent[0].callback(new Error('PRIVATE'));
+  assert.deepEqual(await p, brokerAccepted); await nextTurn(); assert.equal(count, 1);
+});
+test('PUBACK without callback is bounded, and callback errors are sanitised', async t => {
+  const f = await playbackFixture(t), p = f.publish();
+  f.client.emit('packetreceive', { cmd: 'puback', messageId: 100, reasonCode: 0 });
+  f.advance(3000); assert.deepEqual(await p, publishFailed('timeout', 'uncertain'));
+  const q = f.publish(); f.sent[1].callback(new Error('SYNTHETIC_PRIVATE'));
+  assert.deepEqual(await q, publishFailed('publish-error', 'uncertain'));
+});
+test('pre-abort prevents publishing; post-dispatch abort removes waiting and suppresses late results', async t => {
+  const f = await playbackFixture(t), a = new AbortController(); a.abort();
+  assert.deepEqual(await f.publish('play', { signal: a.signal }), publishFailed('cancelled')); assert.equal(f.sent.length, 0);
+  const b = new AbortController(), p = f.publish('pause', { signal: b.signal }); b.abort();
+  assert.deepEqual(await p, publishFailed('cancelled', 'uncertain'));
+  assert.equal(getEventListeners(b.signal, 'abort').length, 0); assert.deepEqual(f.removed, [100]);
+  f.ackPublish(); assert.equal(f.jobs.size, 0); assert.equal(f.sent.length, 1);
+});
+for (const mode of ['close', 'disconnect', 'error']) {
+  test('pending publish settles on ' + mode, async t => {
+    const f = await playbackFixture(t), p = f.publish();
+    if (mode === 'close') {
+      f.transport.close();
+    } else {
+      f.client.emit(mode, { reasonCode: 135 });
+    }
+    assert.deepEqual(await p, publishFailed(mode === 'close' ? 'closed' : 'interrupted', 'uncertain'));
+    f.ackPublish(); f.advance(3000); assert.equal(f.jobs.size, 0); assert.equal(f.sent.length, 1);
+    assert.equal(f.client.connects, 1);
+  });
+}
+test('one pending publication bounds capacity without queuing another request', async t => {
+  const f = await playbackFixture(t), p = f.publish();
+  assert.deepEqual(await f.publish('pause'), publishFailed('capacity')); assert.equal(f.sent.length, 1);
+  f.ackPublish(); await p; const q = f.publish('pause'); f.ackPublish(); assert.deepEqual(await q, brokerAccepted);
+});
+test('late expired ACK cannot finish the next operation, and packet IDs cannot be reused', async t => {
+  const f = await playbackFixture(t), p = f.publish(); f.advance(3000); await p;
+  const q = f.publish(); f.ackPublish(0, 0); let settled = false; void q.then(() => {
+    settled = true;
+  });
+  await nextTurn(); assert.equal(settled, false); f.ackPublish(); await q;
+  f.client.publish = (name, payload, options) => {
+    f.client.emit('packetsend', { cmd: 'publish', topic: name, payload, ...options, messageId: 100 }); return f.client;
+  };
+  assert.deepEqual(await f.publish(), publishFailed('dependency', 'uncertain'));
+  assert.equal(f.transport.getStatus().phase, 'closed');
+});
+test('reentrant closure inside publish revokes authority before callbacks', async t => {
+  const f = await playbackFixture(t); const original = f.client.publish;
+  f.client.publish = (...args) => {
+    original(...args); f.transport.close(); f.ackPublish(); return f.client;
+  };
+  assert.deepEqual(await f.publish(), publishFailed('closed', 'uncertain')); assert.equal(f.jobs.size, 0);
+});
+test('publish throw or library queue is uncertain and cannot become a later dispatch', async t => {
+  for (const throwing of [true, false]) {
+    const f = await playbackFixture(t);
+    f.client.publish = () => {
+      if (throwing) {
+        throw new Error('SYNTHETIC_PRIVATE');
+      } return f.client;
+    };
+    assert.deepEqual(await f.publish(), publishFailed('dependency', 'uncertain'));
+    assert.equal(f.transport.getStatus().phase, 'closed');
+  }
+});
+test('scheduler throw and synchronous callback fail before publishing', async t => {
+  for (const synchronous of [false, true]) {
+    let command = false;
+    const f = await playbackFixture(t, [routes[0].routeId], { scheduler: { schedule(cb) {
+      if (command) {
+        if (synchronous) {
+          cb(); return () => {};
+        } throw new Error('SYNTHETIC_PRIVATE');
+      }
+      return () => {};
+    } } }); command = true;
+    assert.deepEqual(await f.publish(), publishFailed('dependency')); assert.equal(f.sent.length, 0);
+  }
+});
+test('unsafe packet tracing blocks command dispatch and exposes no command data', async t => {
+  const f = await playbackFixture(t), saved = debug.disable();
+  try {
+    debug.enable('mqtt-packet:writeToStream');
+    assert.deepEqual(await f.publish(), publishFailed('unsafe-tracing')); assert.equal(f.sent.length, 0);
+  } finally {
+    debug.enable(saved);
+  }
+});
+
+async function realPlaybackFixture(t) {
+  let now = 0;
+  const jobs = new Set();
+  const f = realFixture(t, acceptSubscriptions, {
+    clock: { now: () => ({ monotonicMs: now, wallMs: 1800000000000 + now }) },
+    scheduler: { schedule(callback, delay) {
+      const j = { callback, deadline: now + delay }; jobs.add(j); return () => jobs.delete(j);
+    } },
+  });
+  assert.equal((await f.start({ playbackRouteIds: [routes[0].routeId] })).ok, true);
+  const removed = [], remove = f.client.removeOutgoingMessage.bind(f.client);
+  f.client.removeOutgoingMessage = id => {
+    removed.push(id); return remove(id);
+  };
+  t.after(() => {
+    assert.equal(jobs.size, 0);
+    assert.equal(f.client.listenerCount('packetsend'), 0);
+    assert.equal(f.client.listenerCount('packetreceive'), 0);
+  });
+  return { ...f, client: f.client, jobs, removed,
+    publish: (action = 'play', signal) => f.adapter.publishPlayback(routes[0].routeId, action, { signal }),
+    commands: () => f.socket.sent.filter(p => p.cmd === 'publish'),
+    advance(ms) {
+      now += ms;
+      for (const j of [...jobs]) {
+        if (j.deadline <= now && jobs.delete(j)) {
+          j.callback();
+        }
+      }
+    },
+  };
+}
+for (const [code, reason] of [[0, undefined], [16, 'no-subscribers'], [128, 'broker-refused'], [135, 'broker-refused'], [151, 'broker-refused']]) {
+  test('real MQTT.js outgoing QoS-1 PUBACK classification ' + code, async t => {
+    const f = await realPlaybackFixture(t);
+    const respond = f.socket.respond;
+    f.socket.respond = p => {
+      respond(p);
+      if (p.cmd === 'publish') {
+        queueMicrotask(() => f.socket.receive({ cmd: 'puback', messageId: p.messageId, reasonCode: code }));
+      }
+    };
+    const result = await f.publish();
+    assert.deepEqual(result, reason ? publishFailed(reason, 'uncertain') : brokerAccepted);
+    const [p] = f.commands();
+    assert.equal(p.topic, 'external/toniebox/SYNTHETIC-MAC/app-control/playback');
+    assert.equal(p.payload.toString(), '{"action":"start"}'); assert.equal(p.qos, 1); assert.equal(p.retain, false);
+    assert.equal(p.dup, false); assert.equal(f.socket.sent.filter(p => p.cmd === 'subscribe').length, 1);
+    assert.equal(f.client.options.reconnectPeriod, 0); assert.equal(f.client.options.resubscribe, false);
+    assert.equal(f.client.options.clean, true); assert.equal(f.client.options.properties.sessionExpiryInterval, 0);
+    assert.equal(f.adapter.getStatus().phase, 'ready'); assert.equal(f.jobs.size, 0);
+    f.socket.receive({ cmd: 'publish', topic, payload: Buffer.from('still receiving'), qos: 1, messageId: 500, retain: false, dup: false });
+    await flush(); assert.equal(f.messages.at(-1).payload.length, 15);
+    assert.ok(f.socket.sent.some(p => p.cmd === 'puback' && p.messageId === 500));
+  });
+}
+for (const mode of ['timeout', 'abort', 'close', 'disconnect']) {
+  test('real pending publish ' + mode + ' removes authority and never replays', async t => {
+    const f = await realPlaybackFixture(t), controller = new AbortController();
+    const p = f.publish('pause', controller.signal); await flush(); const id = f.commands()[0].messageId;
+    if (mode === 'timeout') {
+      f.advance(3000);
+    }
+    if (mode === 'abort') {
+      controller.abort();
+    }
+    if (mode === 'close') {
+      f.adapter.close();
+    }
+    if (mode === 'disconnect') {
+      f.socket.receive({ cmd: 'disconnect', reasonCode: 0 });
+    }
+    const result = await p;
+    const reason = mode === 'abort' ? 'cancelled' : mode === 'disconnect' ? 'interrupted' : mode === 'close' ? 'closed' : mode;
+    assert.deepEqual(result, publishFailed(reason, 'uncertain'));
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+    assert.deepEqual(f.removed, [id]);
+    if (mode === 'timeout' || mode === 'abort') {
+      f.socket.receive({ cmd: 'puback', messageId: id, reasonCode: 0 }); await flush();
+      const q = f.publish('play'); await flush(); const next = f.commands().at(-1).messageId;
+      assert.notEqual(next, id);
+      f.socket.receive({ cmd: 'puback', messageId: id, reasonCode: 0 });
+      f.socket.receive({ cmd: 'puback', messageId: next, reasonCode: 0 });
+      assert.deepEqual(await q, brokerAccepted); assert.equal(f.commands().length, 2);
+    } else {
+      assert.deepEqual(await f.publish(), publishFailed('closed')); assert.equal(f.commands().length, 1);
+    }
+    assert.equal(f.socket.sent.filter(p => p.cmd === 'connect').length, 1);
+    assert.equal(f.socket.sent.filter(p => p.cmd === 'subscribe').length, 1);
+  });
+}
+test('real wrong-id and duplicate PUBACK cannot establish a different publication', async t => {
+  const f = await realPlaybackFixture(t), p = f.publish(); await flush(); const id = f.commands()[0].messageId;
+  let done = false; void p.then(() => {
+    done = true;
+  });
+  f.socket.receive({ cmd: 'puback', messageId: id + 1, reasonCode: 0 }); await flush(); assert.equal(done, false);
+  f.socket.receive({ cmd: 'puback', messageId: id, reasonCode: 0 }); assert.deepEqual(await p, brokerAccepted);
+  f.socket.receive({ cmd: 'puback', messageId: id, reasonCode: 135 }); await flush();
+  assert.equal(f.adapter.getStatus().phase, 'ready'); assert.equal(f.commands().length, 1);
+});
+test('real parser rejects malformed PUBACK before packetreceive and interrupts the command', async t => {
+  const f = await realPlaybackFixture(t), p = f.publish(); await flush(); const id = f.commands()[0].messageId;
+  f.socket.receive({ cmd: 'puback', messageId: id, reasonCode: 1 });
+  assert.deepEqual(await p, publishFailed('interrupted', 'uncertain'));
+  assert.equal(f.adapter.getStatus().phase, 'closed');
+});
+test('real cancellation at packetsend remains uncertain and never retries transmitted command', async t => {
+  const f = await realPlaybackFixture(t), controller = new AbortController();
+  f.client.once('packetsend', packet => {
+    if (packet.cmd === 'publish') {
+      controller.abort();
+    }
+  });
+  assert.deepEqual(await f.publish('play', controller.signal), publishFailed('cancelled', 'uncertain'));
+  await flush(); assert.equal(f.commands().length, 1); // Cancellation cannot retract a library write already entered.
+  f.advance(5000); assert.equal(f.commands().length, 1); assert.equal(f.jobs.size, 0);
+});
+test('real lost connection before library dispatch never queues a command for reconnection', async t => {
+  const f = await realPlaybackFixture(t); const publish = f.client.publish.bind(f.client);
+  f.client.publish = (...args) => {
+    f.client.connected = false; return publish(...args);
+  };
+  assert.deepEqual(await f.publish(), publishFailed('dependency', 'uncertain'));
+  await flush(); assert.equal(f.commands().length, 0); assert.equal(f.adapter.getStatus().phase, 'closed');
+});
+test('early, repeated and cancellation-failed deadline callbacks cannot extend or duplicate command ownership', async t => {
+  let mono = 0; const callbacks = []; let command = false;
+  const f = await playbackFixture(t, [routes[0].routeId], {
+    clock: { now: () => ({ monotonicMs: mono, wallMs: 1800000000000 + mono }) },
+    scheduler: { schedule(cb) {
+      if (command) {
+        callbacks.push(cb); return () => {
+          throw new Error('PRIVATE');
+        };
+      }
+      return () => {};
+    } },
+  }); command = true;
+  const p = f.publish(); const first = callbacks[0]; mono = 1; first(); first(); assert.equal(callbacks.length, 2);
+  mono = 3000; callbacks[1](); assert.deepEqual(await p, publishFailed('timeout', 'uncertain'));
+  callbacks[1](); first(); assert.equal(callbacks.length, 2); assert.equal(f.sent.length, 1);
+});
+test('clock invalidation and scheduler reentrant shutdown settle without leaked command signals', async t => {
+  for (const mode of ['clock', 'scheduler']) {
+    let command = false, f;
+    f = await playbackFixture(t, [routes[0].routeId], {
+      clock: { now: () => {
+        if (command && mode === 'clock') {
+          f.transport.close();
+        }
+        return { monotonicMs: 0, wallMs: 1800000000000 };
+      } },
+      scheduler: { schedule() {
+        if (command && mode === 'scheduler') {
+          f.transport.close();
+        }
+        return () => {};
+      } },
+    }); command = true; const controller = new AbortController();
+    assert.deepEqual(await f.publish('play', { signal: controller.signal }), publishFailed('closed'));
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0); assert.equal(f.sent.length, 0);
+  }
+});
+test('ACK at an elapsed deadline fails even before the scheduled callback runs', async t => {
+  const f = await playbackFixture(t), p = f.publish(); f.advance(3000, false); f.ackPublish();
+  assert.deepEqual(await p, publishFailed('timeout', 'uncertain')); assert.equal(f.jobs.size, 0);
+});
+
+test('multiple approved routes require individual explicit permission and cannot redirect destinations', async t => {
+  const f = fixture(t), r = [...routes, { routeId: 'SECOND', macAddress: 'SECOND-MAC' }];
+  const start = f.transport.connect(credentials, r, { playbackRouteIds: ['SECOND'] });
+  f.connected(); f.client.connected = true; f.ack(); await start;
+  assert.equal(Object.keys(f.client.request).length, 14);
+  assert.deepEqual(await f.transport.publishPlayback(routes[0].routeId, 'play'), publishFailed('not-authorised'));
+  let sent;
+  f.client.publish = (topic, payload, options, cb) => {
+    sent = topic; f.client.emit('packetsend', { cmd: 'publish', topic, payload, ...options, messageId: 2 });
+    f.client.emit('packetreceive', { cmd: 'puback', messageId: 2, reasonCode: 0 }); cb(null); return f.client;
+  };
+  assert.deepEqual(await f.transport.publishPlayback('SECOND', 'pause'), brokerAccepted);
+  assert.equal(sent, 'external/toniebox/SECOND-MAC/app-control/playback');
+});
+test('permission getter reentrant close cannot resurrect a transport', async t => {
+  const f = fixture(t);
+  const result = await f.transport.connect(credentials, routes, { get playbackRouteIds() {
+    f.transport.close(); return [routes[0].routeId];
+  } });
+  assert.equal(result.error.kind, 'closed'); assert.equal(f.client, undefined); assert.equal(f.transport.getStatus().phase, 'closed');
+});
+test('reentrant abort-listener installation is cleaned even when added after close', async t => {
+  const f = await playbackFixture(t), controller = new AbortController();
+  const add = controller.signal.addEventListener.bind(controller.signal);
+  controller.signal.addEventListener = (...args) => {
+    f.transport.close(); return add(...args);
+  };
+  assert.deepEqual(await f.publish('play', { signal: controller.signal }), publishFailed('closed'));
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0); assert.equal(f.sent.length, 0);
+});
+test('public packet observer exceptions are contained and results never expose private values', async t => {
+  const f = await playbackFixture(t), p = f.publish();
+  f.client.emit('packetreceive', { get cmd() {
+    throw new Error('SYNTHETIC_PRIVATE');
+  } });
+  const result = await p;
+  assert.deepEqual(result, publishFailed('invalid-acknowledgement', 'uncertain'));
+  assert.doesNotMatch(JSON.stringify([result, f.transport.getStatus()]), /SYNTHETIC|external\/|action|token|password/i);
+});
+test('public outgoing cleanup failure closes safely without leaking a pending operation', async t => {
+  const f = await playbackFixture(t), p = f.publish();
+  f.client.removeOutgoingMessage = () => {
+    throw new Error('SYNTHETIC_PRIVATE');
+  };
+  f.advance(3000); assert.deepEqual(await p, publishFailed('timeout', 'uncertain'));
+  assert.equal(f.transport.getStatus().phase, 'closed'); assert.equal(f.jobs.size, 0);
+});
+
+test('reentrant permission getter cannot replace the admitted route plan or create a second connection', async t => {
+  const f = fixture(t); let nested;
+  const p = f.transport.connect(credentials, routes, { get playbackRouteIds() {
+    nested = f.transport.connect(credentials, [{ routeId: 'OTHER', macAddress: 'OTHER-MAC' }], { playbackRouteIds: ['OTHER'] });
+    return [routes[0].routeId];
+  } });
+  assert.equal((await nested).error.kind, 'closed');
+  f.connected(); f.client.connected = true; f.ack(); assert.equal((await p).ok, true);
+  assert.equal(f.client.connects, 1); assert.equal(Object.keys(f.client.request).length, 7);
+  assert.ok(Object.keys(f.client.request).every(topic => topic.startsWith('external/toniebox/SYNTHETIC-MAC/')));
+  assert.deepEqual(await f.transport.publishPlayback('OTHER', 'play'), publishFailed('not-authorised'));
+});
+test('duplicate permissions fail even within the approved route-count bound', async t => {
+  const f = fixture(t);
+  const result = await f.transport.connect(credentials, [...routes, { routeId: 'SECOND', macAddress: 'SECOND-MAC' }],
+    { playbackRouteIds: [routes[0].routeId, routes[0].routeId] });
+  assert.equal(result.error.kind, 'invalid-input'); assert.equal(f.client, undefined);
 });
