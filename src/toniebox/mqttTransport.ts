@@ -6,11 +6,29 @@ import { Duplex, Transform } from 'node:stream';
 import { MqttClient } from 'mqtt';
 import WebSocket, { createWebSocketStream } from 'ws';
 import type { MqttCredentials, MqttFailure, MqttMessage, MqttResult, MqttRoute,
-  MqttStatus, MqttTransport, MqttTransportOptions } from './mqttTransportTypes.js';
+  MqttStatus, MqttTransport, MqttTransportOptions, PlaybackPublishFailure, PlaybackPublishResult } from './mqttTransportTypes.js';
 
 const PACKET_LIMIT = 128 * 1024;
 const PAYLOAD_LIMIT = 64 * 1024;
 const BUFFER_LIMIT = 1024 * 1024;
+const PUBLISH_ACK_MS = 3000;
+const COMMAND_PAYLOAD_LIMIT = 64;
+const PUBACK_REASONS = new Set([0, 16, 128, 131, 135, 144, 145, 151, 153]);
+interface Publication {
+  readonly topic: string;
+  readonly payload: string;
+  deadline: number;
+  readonly owner: MqttClient;
+  readonly resolve: (result: PlaybackPublishResult) => void;
+  invoked: boolean;
+  packetId?: number;
+  acknowledgement?: number;
+  callbackDone: boolean;
+  callbackFailed: boolean;
+  timerEpoch?: object;
+  cancelTimer?: () => void;
+  removeAbort?: () => void;
+}
 const SUFFIXES = ['metrics/battery', 'online-state', 'metrics/headphones', 'settings-applied',
   'playback/state', 'volume/state', 'app-reply/bedtime-state'] as const;
 const require = createRequire(import.meta.url);
@@ -103,7 +121,7 @@ function productionStream(): Duplex {
 const text = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 256
   && !/\s/u.test(v) && [...v].every(c => c.charCodeAt(0) > 31 && (c.charCodeAt(0) < 127 || c.charCodeAt(0) > 159));
 
-/** Single-use adapter. No token acquisition, session generation, publishing or reconnect policy. */
+/** Single-use adapter. No token acquisition, session generation or reconnect policy. Publishing is explicitly opt-in. */
 export function createMqttTransport(options: MqttTransportOptions): MqttTransport {
   if (!options || typeof options.onMessage !== 'function'
     || (options.onStatus !== undefined && typeof options.onStatus !== 'function')
@@ -134,7 +152,15 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
   let bytes = 0;
   let draining = false;
   let streamBuilt = false;
+  let connectCalled = false;
   const topics = new Map<string, string>();
+  const playbackTopics = new Map<string, string>();
+  // Never reuse a command packet ID in this single-use client: a late ACK cannot
+  // complete another command. Bounded by MQTT's 65,535 packet identifiers.
+  const usedPublishIds = new Set<number>();
+  let publication: Publication | undefined;
+  let dispatching = false;
+  let settling = false;
   const active = (): boolean => status.phase !== 'closed';
   const now = (): { monotonicMs: number; wallMs: number } => {
     const value = clock.now();
@@ -187,6 +213,158 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
         }
       }
     }, Math.max(1, Math.ceil(deadline - now().monotonicMs)));
+  };
+  const publishFailure = (reason: PlaybackPublishFailure, invoked = false): PlaybackPublishResult => ({
+    ok: false, reason, delivery: invoked ? 'uncertain' : 'not-dispatched',
+  });
+  const settlePublication = (p: Publication, result: PlaybackPublishResult): void => {
+    if (publication !== p) {
+      return;
+    }
+    publication = undefined; // Revoke before timer, signal and library callbacks can reenter.
+    p.timerEpoch = undefined;
+    settling = true;
+    let cleanupFailed = false;
+    try {
+      try {
+        p.cancelTimer?.();
+      } catch { /* Deadline callbacks also check ownership. */ }
+      try {
+        p.removeAbort?.();
+      } catch {
+        cleanupFailed = true;
+      }
+      if (p.packetId !== undefined && (!p.callbackDone || p.acknowledgement === undefined)) {
+        try {
+          p.owner.removeOutgoingMessage(p.packetId);
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+      p.resolve(result);
+      if (cleanupFailed || (p.invoked && p.packetId === undefined)) {
+        // A queued/untrackable command cannot be allowed to dispatch later.
+        finish({ kind: 'dependency' });
+      }
+    } finally {
+      settling = false;
+    }
+  };
+  const publicationCurrent = (p: Publication): boolean => {
+    if (publication !== p) {
+      return false;
+    }
+    try {
+      if (status.phase !== 'ready' || client !== p.owner || !p.owner.connected) {
+        settlePublication(p, publishFailure(active() ? 'interrupted' : 'closed', p.invoked));
+        return false;
+      }
+      if (now().monotonicMs >= p.deadline) {
+        settlePublication(p, publishFailure('timeout', p.invoked));
+        return false;
+      }
+      if (tracing()) {
+        settlePublication(p, publishFailure('unsafe-tracing', p.invoked));
+        finish({ kind: 'unsafe-tracing' });
+        return false;
+      }
+      return publication === p && status.phase === 'ready';
+    } catch {
+      settlePublication(p, publishFailure('dependency', p.invoked));
+      return false;
+    }
+  };
+  const completePublication = (p: Publication): void => {
+    if (!publicationCurrent(p) || !p.callbackDone) {
+      return;
+    }
+    const reason = p.acknowledgement;
+    if (reason === 16) {
+      settlePublication(p, publishFailure('no-subscribers', true));
+    } else if (reason !== undefined && reason !== 0) {
+      settlePublication(p, publishFailure('broker-refused', true));
+    } else if (p.callbackFailed) {
+      settlePublication(p, publishFailure('publish-error', true));
+    } else if (reason === 0) {
+      settlePublication(p, { ok: true, acknowledgement: 'broker' });
+    }
+    // A callback without a matching PUBACK is not success; the deadline still applies.
+  };
+  function onPacketSend(packet: { cmd: string; topic?: string; payload?: unknown; qos?: number; retain?: boolean; messageId?: number }): void {
+    const p = publication;
+    try {
+      if (packet.cmd !== 'publish') {
+        return;
+      }
+      if (!p || !p.invoked || !publicationCurrent(p)) {
+        finish({ kind: 'protocol' }); return;
+      }
+      const id = packet.messageId;
+      if (p.packetId !== undefined || !Number.isInteger(id) || id === undefined || id < 1 || id > 65535
+        || usedPublishIds.has(id) || packet.topic !== p.topic || packet.qos !== 1 || packet.retain !== false
+        || !(typeof packet.payload === 'string' || Buffer.isBuffer(packet.payload))
+        || packet.payload.toString() !== p.payload) {
+        settlePublication(p, publishFailure('dependency', true));
+        finish({ kind: 'protocol' }); return;
+      }
+      p.packetId = id;
+      usedPublishIds.add(id);
+    } catch {
+      if (p) {
+        settlePublication(p, publishFailure('dependency', p.invoked));
+      }
+      finish({ kind: 'dependency' });
+    }
+  }
+  function onPacketReceive(packet: { cmd: string; messageId?: number; reasonCode?: number }): void {
+    const p = publication;
+    if (!p) {
+      return;
+    }
+    try {
+      if (packet.cmd !== 'puback' || packet.messageId !== p.packetId || p.packetId === undefined) {
+        return; // Unrelated and late ACKs cannot acquire an operation's authority.
+      }
+      if (!publicationCurrent(p) || p.acknowledgement !== undefined) {
+        return;
+      }
+      const code = packet.reasonCode === undefined ? 0 : packet.reasonCode;
+      if (!Number.isInteger(code) || !PUBACK_REASONS.has(code)) {
+        settlePublication(p, publishFailure('invalid-acknowledgement', true)); return;
+      }
+      p.acknowledgement = code;
+      completePublication(p);
+    } catch {
+      settlePublication(p, publishFailure('invalid-acknowledgement', p.invoked));
+    }
+  }
+  const armPublication = (p: Publication): void => {
+    let installing = true;
+    const epoch = p.timerEpoch = {};
+    const cancel = scheduler.schedule(() => {
+      if (publication !== p || p.timerEpoch !== epoch) {
+        return;
+      }
+      p.timerEpoch = undefined;
+      if (installing) {
+        settlePublication(p, publishFailure('dependency', p.invoked)); return;
+      }
+      if (publicationCurrent(p)) {
+        try {
+          armPublication(p);
+        } catch {
+          settlePublication(p, publishFailure('dependency', p.invoked));
+        }
+      }
+    }, Math.max(1, Math.ceil(p.deadline - now().monotonicMs)));
+    installing = false;
+    if (publication === p) {
+      p.cancelTimer = cancel;
+    } else {
+      try {
+        cancel();
+      } catch { /* Already revoked. */ }
+    }
   };
   const deliver = (message: MqttMessage): void => {
     if (!check()) {
@@ -317,6 +495,8 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
     }
   }
   const disposeClient = (owned: MqttClient): void => {
+    owned.removeListener('packetsend', onPacketSend);
+    owned.removeListener('packetreceive', onPacketReceive);
     owned.removeListener('connect', onConnect);
     owned.removeListener('message', onMessage);
     owned.removeListener('close', onClose);
@@ -344,6 +524,13 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
     }
     status = { phase: 'closed', error };
     finish = () => undefined; // Terminal disposal is also inert during reentrant cleanup callbacks.
+    if (publication) {
+      const reason = error.kind === 'closed' ? 'closed' : error.kind === 'cancelled' ? 'cancelled'
+        : error.kind === 'unsafe-tracing' ? 'unsafe-tracing' : 'interrupted';
+      settlePublication(publication, publishFailure(reason, publication.invoked));
+    }
+    playbackTopics.clear();
+    usedPublishIds.clear();
     const settled = resolve;
     resolve = undefined;
     try {
@@ -377,10 +564,93 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
   return {
     getStatus: () => ({ ...status, ...(status.error ? { error: { ...status.error } } : {}) }),
     close: () => finish({ kind: 'closed' }),
+    publishPlayback(routeId, action, requestOptions = {}): Promise<PlaybackPublishResult> {
+      let signal: AbortSignal | undefined;
+      try {
+        if (!text(routeId) || !['play', 'pause'].includes(action) || !requestOptions
+          || typeof requestOptions !== 'object' || Array.isArray(requestOptions)) {
+          return Promise.resolve(publishFailure('invalid-input'));
+        }
+        signal = requestOptions.signal;
+        if (signal !== undefined && !(signal instanceof AbortSignal)) {
+          return Promise.resolve(publishFailure('invalid-input'));
+        }
+        if (signal?.aborted) {
+          return Promise.resolve(publishFailure('cancelled'));
+        }
+        if (!active()) {
+          return Promise.resolve(publishFailure('closed'));
+        }
+        if (status.phase !== 'ready' || !client?.connected) {
+          return Promise.resolve(publishFailure('not-ready'));
+        }
+        const topic = playbackTopics.get(routeId);
+        if (!topic) {
+          return Promise.resolve(publishFailure('not-authorised'));
+        }
+        if (publication || dispatching || settling || usedPublishIds.size >= 65535) {
+          return Promise.resolve(publishFailure('capacity'));
+        }
+        const payload = action === 'play' ? '{"action":"start"}' : '{"action":"pause"}';
+        if (Buffer.byteLength(payload) > COMMAND_PAYLOAD_LIMIT) {
+          return Promise.resolve(publishFailure('invalid-input'));
+        }
+        const owner = client;
+        dispatching = true;
+        return new Promise<PlaybackPublishResult>(done => {
+          const p: Publication = { topic, payload, owner, resolve: done, deadline: 0,
+            invoked: false, callbackDone: false, callbackFailed: false };
+          try {
+            // Install ownership before clock/scheduler/signal seams can reenter.
+            publication = p;
+            p.deadline = now().monotonicMs + PUBLISH_ACK_MS;
+            if (publication !== p) {
+              return;
+            }
+            const abort = (): void => settlePublication(p, publishFailure('cancelled', p.invoked));
+            p.removeAbort = () => signal?.removeEventListener('abort', abort);
+            signal?.addEventListener('abort', abort, { once: true });
+            if (publication !== p) {
+              p.removeAbort(); return;
+            }
+            if (signal?.aborted) {
+              abort();
+            }
+            if (publication !== p) {
+              return;
+            }
+            armPublication(p);
+            if (!publicationCurrent(p)) {
+              return;
+            }
+            p.invoked = true; // Calling the library makes downstream delivery uncertain, even if it throws.
+            owner.publish(topic, payload, { qos: 1, retain: false }, error => {
+              if (publication !== p || p.callbackDone) {
+                return;
+              }
+              p.callbackDone = true; p.callbackFailed = !!error;
+              completePublication(p);
+            });
+            if (publication === p && p.packetId === undefined) {
+              settlePublication(p, publishFailure('dependency', true)); // No offline/library queue accepted.
+            }
+          } catch {
+            settlePublication(p, publishFailure('dependency', p.invoked));
+          } finally {
+            dispatching = false;
+          }
+        });
+      } catch {
+        dispatching = false;
+        return Promise.resolve(publishFailure('invalid-input'));
+      }
+    },
     connect(credentials: MqttCredentials, routes: readonly MqttRoute[], requestOptions = {}): Promise<MqttResult> {
-      if (status.phase !== 'idle') {
+      if (status.phase !== 'idle' || connectCalled) {
         return Promise.resolve({ ok: false, error: { kind: 'closed' } });
       }
+      // Claim single-use ownership before input getters or injected clock callbacks can reenter.
+      connectCalled = true;
       try {
         if (!credentials || !text(credentials.uuid) || typeof credentials.accessToken !== 'string'
           || !/^[\x21-\x7e]+$/u.test(credentials.accessToken) || credentials.accessToken.length > 65535
@@ -391,21 +661,38 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
         const ids = new Set<string>();
         const macs = new Set<string>();
         let size = 0;
+        const commandRoutes = new Map<string, string>();
         for (const route of routes) {
-          if (!route || !text(route.routeId) || !text(route.macAddress) || /[/\\+#]/u.test(route.macAddress)) {
+          if (!route) {
             throw safeError('invalid-input');
           }
-          const mac = route.macAddress.toUpperCase();
-          if (ids.has(route.routeId) || macs.has(mac)) {
+          const routeId = route.routeId, macAddress = route.macAddress;
+          if (!text(routeId) || !text(macAddress) || /[/\\+#]/u.test(macAddress)) {
             throw safeError('invalid-input');
           }
-          ids.add(route.routeId);
+          const mac = macAddress.toUpperCase();
+          if (ids.has(routeId) || macs.has(mac)) {
+            throw safeError('invalid-input');
+          }
+          ids.add(routeId);
           macs.add(mac);
+          commandRoutes.set(routeId, 'external/toniebox/' + mac + '/app-control/playback');
           for (const suffix of SUFFIXES) {
             const topic = 'external/toniebox/' + mac + '/' + suffix;
             size += Buffer.byteLength(topic) + 3;
-            topics.set(topic, route.routeId);
+            topics.set(topic, routeId);
           }
+        }
+        const requestedPermissions = requestOptions.playbackRouteIds;
+        const permissions = requestedPermissions === undefined ? [] : requestedPermissions;
+        if (!Array.isArray(permissions) || permissions.length > routes.length) {
+          throw safeError('invalid-input');
+        }
+        for (const id of permissions) {
+          if (!text(id) || !commandRoutes.has(id) || playbackTopics.has(id)) {
+            throw safeError('invalid-input');
+          }
+          playbackTopics.set(id, commandRoutes.get(id)!);
         }
         if (size > PAYLOAD_LIMIT) {
           throw safeError('invalid-input');
@@ -413,6 +700,9 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
       } catch {
         finish({ kind: 'invalid-input' });
         return Promise.resolve({ ok: false, error: { kind: 'invalid-input' } });
+      }
+      if (status.phase !== 'idle') {
+        return Promise.resolve({ ok: false, error: { kind: 'closed' } });
       }
       return new Promise<MqttResult>(done => {
         resolve = done;
@@ -461,6 +751,10 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
             disposeClient(client);
             client = undefined;
             return;
+          }
+          if (playbackTopics.size) {
+            client.on('packetsend', onPacketSend);
+            client.on('packetreceive', onPacketReceive);
           }
           client.on('error', onError);
           client.on('close', onClose);

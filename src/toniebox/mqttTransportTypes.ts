@@ -35,8 +35,25 @@ export interface MqttTransportOptions {
   /** Trusted test seam; must remain inert until connect(). Never exposed by the adapter. */
   readonly clientFactory?: (builder: () => Duplex, options: IClientOptions) => MqttClient;
 }
+export type PlaybackAction = 'play' | 'pause';
+export type PlaybackPublishFailure = 'invalid-input' | 'not-authorised' | 'not-ready' | 'capacity'
+  | 'closed' | 'interrupted' | 'cancelled' | 'timeout' | 'invalid-acknowledgement'
+  | 'no-subscribers' | 'broker-refused' | 'publish-error' | 'unsafe-tracing' | 'dependency';
+/** Broker acceptance only, never physical execution. "uncertain" includes any call into publish(). */
+export type PlaybackPublishResult = { readonly ok: true; readonly acknowledgement: 'broker' } | {
+  readonly ok: false;
+  readonly reason: PlaybackPublishFailure;
+  readonly delivery: 'not-dispatched' | 'uncertain';
+};
+export interface MqttConnectOptions {
+  readonly signal?: AbortSignal;
+  /** Explicit subset of connect() route IDs. Empty by default; copied before connecting. */
+  readonly playbackRouteIds?: readonly string[];
+}
 export interface MqttTransport {
-  connect(credentials: MqttCredentials, routes: readonly MqttRoute[], options?: { signal?: AbortSignal }): Promise<MqttResult>;
+  connect(credentials: MqttCredentials, routes: readonly MqttRoute[], options?: MqttConnectOptions): Promise<MqttResult>;
+  /** Ready-only, QoS 1, non-retained. One pending request, 3s acknowledgement deadline; no replay. */
+  publishPlayback(routeId: string, action: PlaybackAction, options?: { readonly signal?: AbortSignal }): Promise<PlaybackPublishResult>;
   getStatus(): MqttStatus;
   close(): void;
 }
