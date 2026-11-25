@@ -1,3 +1,4 @@
+import type { PlaybackAction, PlaybackPublishFailure } from './mqttTransportTypes.js';
 import type { CommissioningObservation } from './commissioning.js';
 import type { AuthClient, AuthCredentials } from './authTypes.js';
 import type { DeviceObservation } from './backendState.js';
@@ -59,7 +60,15 @@ export interface ProductionChange {
   readonly reasons: readonly ProductionChangeReason[];
 }
 
+/** Private identity precondition, never diagnostic data. Copied at request admission. */
+export interface PlaybackTarget { readonly accountUuid: string; readonly routeId: string; readonly macAddress: string }
+export type PlaybackRequestFailure = PlaybackPublishFailure | 'insufficient-state' | 'busy' | 'invalidated' | 'stopped';
+export type PlaybackRequestResult = { readonly ok: true; readonly outcome: 'already-satisfied' | 'confirmed' } | {
+  readonly ok: false; readonly reason: PlaybackRequestFailure; readonly delivery: 'not-dispatched' | 'uncertain';
+};
 export interface AccountCoordinatorOptions {
+  /** Trusted internal integration opt-in only. Normal Homebridge construction remains read-only. */
+  readonly enablePlaybackCommands?: boolean;
   /** Deferred passive internal observer. Exceptions/rejections are contained; no timers or I/O. */
   readonly onProductionChange?: (notice: ProductionChange) => void;
   /** Explicit passive opt-in; receives only bounded, identifier-free projections. */
@@ -83,6 +92,9 @@ export interface AccountCoordinator {
   /** Concurrent callers share a run; caller abort cancels only its own wait. */
   discover(options?: { readonly signal?: AbortSignal }): Promise<CoordinatorResult>;
   getStatus(): CoordinatorStatus;
+  /** Five-second bounded physical-state confirmation; no command queue or replay. */
+  requestPlayback(target: PlaybackTarget, action: PlaybackAction,
+    options?: { readonly signal?: AbortSignal }): Promise<PlaybackRequestResult>;
   /** Detached, frozen current production authority only. Empty after revocation; excludes experiments.
    * last-known means existing approval retained by reconciliation, never permission inferred from state. */
   getProductionInventory(): ProductionInventory;

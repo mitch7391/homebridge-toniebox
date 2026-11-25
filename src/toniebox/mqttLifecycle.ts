@@ -1,7 +1,7 @@
 import { performance } from 'node:perf_hooks';
 
 import { createMqttTransport } from './mqttTransport.js';
-import type { MqttMessage, MqttStatus, MqttTransport } from './mqttTransportTypes.js';
+import type { MqttMessage, MqttStatus, MqttTransport, PlaybackAction, PlaybackPublishFailure, PlaybackPublishResult } from './mqttTransportTypes.js';
 import type { CredentialSnapshot, TokenManagerFailureKind, TokenManagerStatus } from './tokenManagerTypes.js';
 import type {
   MqttLifecycle, MqttLifecycleFailure, MqttLifecycleOptions, MqttLifecycleStatus,
@@ -46,6 +46,32 @@ interface Attempt {
   readyAt?: number;
   session?: number;
 }
+interface Publication {
+  readonly controller: AbortController;
+  readonly resolve: (result: PlaybackPublishResult) => void;
+  invoked: boolean;
+  cleanup?: () => void;
+}
+const PUBLISH_FAILURES: readonly PlaybackPublishFailure[] = ['invalid-input', 'not-authorised', 'not-ready', 'capacity',
+  'closed', 'interrupted', 'cancelled', 'timeout', 'invalid-acknowledgement', 'no-subscribers', 'broker-refused',
+  'publish-error', 'unsafe-tracing', 'dependency'];
+/** Internal defensive projection shared with the coordinator; never forwards dependency metadata. */
+export function playbackPublishResult(raw: unknown): PlaybackPublishResult | undefined {
+  if (!object(raw)) {
+    return undefined;
+  }
+  const { ok, acknowledgement, reason, delivery } = raw;
+  if (ok === true && acknowledgement === 'broker') {
+    return Object.freeze({ ok: true, acknowledgement: 'broker' });
+  }
+  const kind = PUBLISH_FAILURES.find(value => value === reason);
+  if (ok === false && kind && (delivery === 'not-dispatched' || delivery === 'uncertain')) {
+    return Object.freeze({ ok: false, reason: kind, delivery });
+  }
+  return undefined;
+}
+const publishFailure = (reason: PlaybackPublishFailure, invoked = false): PlaybackPublishResult =>
+  Object.freeze({ ok: false, reason, delivery: invoked ? 'uncertain' : 'not-dispatched' });
 interface Preparation { controller: AbortController; target: number }
 interface Alarm { cancel?: () => void; run?: () => void }
 const revision = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
@@ -76,6 +102,8 @@ class AccountMqttLifecycle implements MqttLifecycle {
   readonly #scheduler: NonNullable<MqttLifecycleOptions['scheduler']>;
   #status: MqttLifecycleStatus = { phase: 'idle', connected: false };
   #attempt?: Attempt;
+  #publication?: Publication;
+  #publicationCleanup = false;
   #preparation?: Preparation;
   #unsubscribe?: () => void;
   #started = false;
@@ -132,6 +160,93 @@ class AccountMqttLifecycle implements MqttLifecycle {
     } catch { /* Observational status callbacks cannot disrupt cleanup or leak exceptions. */ }
   }
 
+  #settlePublication(p: Publication, result: PlaybackPublishResult): void {
+    if (this.#publication !== p) {
+      return;
+    }
+    this.#publication = undefined;
+    this.#publicationCleanup = true;
+    try {
+      cancel(p.cleanup);
+      p.resolve(result);
+      p.controller.abort();
+    } finally {
+      this.#publicationCleanup = false;
+    }
+  }
+  #cancelPublication(reason: PlaybackPublishFailure = 'interrupted'): void {
+    const p = this.#publication;
+    if (p) {
+      this.#settlePublication(p, publishFailure(reason, p.invoked));
+    }
+  }
+  publishPlayback(routeId: string, action: PlaybackAction,
+    options: { readonly session: number; readonly signal?: AbortSignal }): Promise<PlaybackPublishResult> {
+    try {
+      if (!object(options)) {
+        return Promise.resolve(publishFailure('invalid-input'));
+      }
+      const { session, signal } = options;
+      if (!text(routeId) || (action !== 'play' && action !== 'pause')
+        || !revision(session) || (signal !== undefined && !(signal instanceof AbortSignal))) {
+        return Promise.resolve(publishFailure('invalid-input'));
+      }
+      if (signal?.aborted) {
+        return Promise.resolve(publishFailure('cancelled'));
+      }
+      if (!this.#options.playbackRouteIds?.includes(routeId)) {
+        return Promise.resolve(publishFailure('not-authorised'));
+      }
+      const attempt = this.#attempt;
+      const ready = (): boolean => !!attempt && this.#current(attempt) && this.#status.phase === 'ready'
+        && this.#status.connected && attempt.session === session && this.#status.session === session;
+      if (!ready() || !this.#permitted() || !ready()) {
+        return Promise.resolve(publishFailure('not-ready'));
+      }
+      if (this.#publication || this.#publicationCleanup) {
+        return Promise.resolve(publishFailure('capacity'));
+      }
+      return new Promise<PlaybackPublishResult>(resolve => {
+        const p: Publication = { controller: new AbortController(), resolve, invoked: false };
+        this.#publication = p;
+        try {
+          const abort = (): void => this.#settlePublication(p, publishFailure('cancelled', p.invoked));
+          p.cleanup = () => signal?.removeEventListener('abort', abort);
+          signal?.addEventListener('abort', abort, { once: true });
+          if (this.#publication !== p) {
+            cancel(p.cleanup); return;
+          }
+          if (signal?.aborted) {
+            abort(); return;
+          }
+          const transport = attempt!.transport, publish = transport?.publishPlayback;
+          if (typeof publish !== 'function') {
+            throw new Error('Invalid publisher');
+          }
+          if (!ready() || !this.#permitted() || !ready() || this.#publication !== p) {
+            this.#settlePublication(p, publishFailure('interrupted', p.invoked)); return;
+          }
+          p.invoked = true;
+          const pending = publish.call(transport, routeId, action, { signal: p.controller.signal });
+          void Promise.resolve(pending).then(raw => {
+            if (this.#publication !== p) {
+              return;
+            }
+            const result = playbackPublishResult(raw);
+            if (!ready() || !this.#permitted() || !ready()) {
+              this.#settlePublication(p, publishFailure('interrupted', true));
+            } else {
+              this.#settlePublication(p, result ?? publishFailure('dependency', true));
+            }
+          }).catch(() => this.#settlePublication(p, publishFailure('dependency', true)));
+        } catch {
+          this.#settlePublication(p, publishFailure('dependency', p.invoked));
+        }
+      });
+    } catch {
+      return Promise.resolve(publishFailure('invalid-input'));
+    }
+  }
   #close(transport?: MqttTransport): boolean {
     try {
       transport?.close();
@@ -168,6 +283,7 @@ class AccountMqttLifecycle implements MqttLifecycle {
       return false;
     }
     if (status.renewal === 'attention-required') {
+      this.#cancelPublication();
       // A locally unexpired token is not permission to reauthenticate after terminal renewal failure.
       if (this.#attempt?.session === undefined) {
         this.#terminate('attention-required', { kind: 'token', tokenFailure: status.reason ?? 'reauthorization-required' });
@@ -298,6 +414,7 @@ class AccountMqttLifecycle implements MqttLifecycle {
         // Revoke old callback authority before publishing the nonterminal transition or closing it.
         previous.retired = true;
         previous.session = undefined;
+        this.#cancelPublication();
         this.#notify();
         previous.controller.abort();
         const closed = this.#close(previous.transport);
@@ -329,6 +446,7 @@ class AccountMqttLifecycle implements MqttLifecycle {
     this.#cancelPreparation();
     const attempt = this.#attempt;
     this.#attempt = undefined; // Revoke authority BEFORE abort/close can invoke callbacks.
+    this.#cancelPublication();
     const alarm = this.#alarm;
     this.#alarm = undefined;
     cancel(alarm?.cancel);
@@ -623,7 +741,8 @@ class AccountMqttLifecycle implements MqttLifecycle {
       this.#lastConnect = dispatch;
       attempt.connecting = true;
       const pending = transport.connect(
-        { uuid: this.#options.accountUuid, accessToken }, this.#options.routes, { signal: attempt.controller.signal },
+        { uuid: this.#options.accountUuid, accessToken }, this.#options.routes, { signal: attempt.controller.signal,
+          ...(this.#options.playbackRouteIds?.length ? { playbackRouteIds: this.#options.playbackRouteIds } : {}) },
       );
       void Promise.resolve(pending).then(result => {
         if (!this.#current(attempt)) {
@@ -822,7 +941,12 @@ export function createMqttLifecycle(options: MqttLifecycleOptions): MqttLifecycl
       macs.add(route.macAddress.toUpperCase());
       return Object.freeze({ routeId: route.routeId, macAddress: route.macAddress });
     });
-    return new AccountMqttLifecycle({ ...options, routes: Object.freeze(routes) });
+    const permissions = options.playbackRouteIds === undefined ? [] : options.playbackRouteIds;
+    if (!Array.isArray(permissions) || permissions.length > routes.length || new Set(permissions).size !== permissions.length
+      || permissions.some(id => !text(id) || !ids.has(id))) {
+      throw new Error('Invalid playback permission');
+    }
+    return new AccountMqttLifecycle({ ...options, routes: Object.freeze(routes), playbackRouteIds: Object.freeze([...permissions]) });
   } catch {
     throw new TypeError('Invalid MQTT lifecycle options');
   }

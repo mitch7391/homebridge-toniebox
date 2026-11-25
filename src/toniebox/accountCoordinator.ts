@@ -4,9 +4,10 @@ import { createAuthClient } from './authClient.js';
 import { createTokenManager } from './tokenManager.js';
 import { createDiscoveryClient } from './discoveryClient.js';
 import { createDiscoveryRunner } from './discoveryRunner.js';
-import { createMqttLifecycle } from './mqttLifecycle.js';
+import { createMqttLifecycle, playbackPublishResult } from './mqttLifecycle.js';
 import { createBackendState } from './backendState.js';
 import { approveRoutes, reconcileRoutes } from './routingPolicy.js';
+import type { PlaybackAction } from './mqttTransportTypes.js';
 import type { AuthCredentials } from './authTypes.js';
 import type { BackendState } from './backendState.js';
 import type { DiscoveryResult, DiscoveryRequestOptions } from './discoveryTypes.js';
@@ -16,7 +17,8 @@ import type { ApprovedRoutePlan, CompatibilityPolicy } from './routingTypes.js';
 import type { TokenClock, TokenManager } from './tokenManagerTypes.js';
 import { MAX_EXPERIMENTAL_CONNECTIONS } from './accountCoordinatorTypes.js';
 import type { AccountCoordinator, AccountCoordinatorOptions, CoordinatorFailure, CoordinatorResult, CoordinatorStatus,
-  DiscoveryRecovery, DiscoveryRecoveryReason, ProductionChangeReason, ProductionInventory } from './accountCoordinatorTypes.js';
+  DiscoveryRecovery, DiscoveryRecoveryReason, ProductionChangeReason, ProductionInventory,
+  PlaybackTarget, PlaybackRequestResult, PlaybackRequestFailure } from './accountCoordinatorTypes.js';
 
 const fail = (reason: CoordinatorFailure, retryAfterMs?: number): CoordinatorResult =>
   ({ ok: false, reason, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
@@ -72,6 +74,27 @@ interface Slot {
   lifecycle?: MqttLifecycle;
   status: MqttLifecycleStatus;
 }
+const commandFailure = (reason: PlaybackRequestFailure, invoked = false): PlaybackRequestResult =>
+  Object.freeze({ ok: false, reason, delivery: invoked ? 'uncertain' : 'not-dispatched' });
+const playbackEligible = (route: ApprovedRoutePlan['routes'][number]): boolean => route.identity.product === 'tb2'
+  && route.identity.generation === 'tng' && route.identity.features?.includes('playbackControls') === true;
+interface Command {
+  readonly context: Context;
+  readonly slot: Slot;
+  readonly target: PlaybackTarget;
+  readonly action: PlaybackAction;
+  readonly session: number;
+  readonly controller: AbortController;
+  readonly resolve: (result: PlaybackRequestResult) => void;
+  readonly deadline: number;
+  invoked: boolean;
+  acknowledged: boolean;
+  /** Undefined until synchronous dispatch admission has returned; reentrant preparation messages cannot confirm. */
+  evidence?: boolean;
+  timerEpoch?: object;
+  cancelTimer?: () => void;
+  removeAbort?: () => void;
+}
 interface Operation { promise: Promise<CoordinatorResult>; resolve(value: CoordinatorResult): void }
 interface Context {
   key: symbol;
@@ -94,6 +117,9 @@ class Coordinator implements AccountCoordinator {
   readonly #clock: TokenClock;
   readonly #tokens: TokenManager;
   #context?: Context;
+  readonly #commands = new Map<string, Command>();
+  #commandAdmission = false;
+  #commandCleanup = false;
   #productionEpoch: object = {};
   #productionPending = new Map<ProductionChangeReason, () => boolean>();
   #productionQueued = false;
@@ -128,6 +154,253 @@ class Coordinator implements AccountCoordinator {
     }
     this.#lastTime = n;
     return n;
+  }
+  #settleCommand(p: Command, result: PlaybackRequestResult): void {
+    if (this.#commands.get(p.target.routeId) !== p) {
+      return;
+    }
+    this.#commands.delete(p.target.routeId); p.timerEpoch = undefined;
+    const cleaning = this.#commandCleanup;
+    this.#commandCleanup = true;
+    try {
+      quiet(() => p.cancelTimer?.()); quiet(() => p.removeAbort?.());
+      p.resolve(result);
+      p.controller.abort();
+    } finally {
+      this.#commandCleanup = cleaning;
+    }
+  }
+  #cancelCommands(reason: PlaybackRequestFailure, slot?: Slot): void {
+    for (const p of [...this.#commands.values()]) {
+      if (!slot || p.slot === slot) {
+        this.#settleCommand(p, commandFailure(reason, p.invoked));
+      }
+    }
+  }
+  #commandState(c: Context, slot: Slot, target: PlaybackTarget, session?: number) {
+    const authorised = (): boolean => this.#options.enablePlaybackCommands === true && this.#current(c) && c.started
+      && !this.#changing && c.production === slot && slot.active && slot.plan.context === c.key
+      && slot.plan.lane === 'production' && this.#status.authority === 'current'
+      && c.uuid === target.accountUuid && slot.plan.accountUuid === target.accountUuid;
+    if (!authorised()) {
+      return { reason: 'not-authorised' as const };
+    }
+    const route = slot.plan.routes.find(r => r.routeId === target.routeId);
+    if (!route || route.macAddress !== target.macAddress || route.identity.id !== target.routeId
+      || route.identity.macAddress !== target.macAddress || !playbackEligible(route)) {
+      return { reason: 'not-authorised' as const };
+    }
+    const renewal = this.#tokens.getStatus().renewal;
+    if (renewal === 'attention-required' || renewal === 'stopped') {
+      return { reason: 'not-ready' as const };
+    }
+    const status = safeStatus(slot.lifecycle!.getStatus());
+    if (!authorised()) {
+      return { reason: 'invalidated' as const };
+    }
+    if (status.phase !== 'ready' || !status.connected || status.session !== slot.status.session
+      || slot.status.phase !== 'ready' || (session !== undefined && status.session !== session)) {
+      return { reason: 'not-ready' as const };
+    }
+    return { ...this.#commandObservation(slot, target), session: status.session! };
+  }
+  #commandObservation(slot: Slot, target: PlaybackTarget) {
+    const observation = slot.state.getDevice(target.routeId);
+    if (!observation || observation.state.identity.id !== target.routeId || observation.state.identity.macAddress !== target.macAddress) {
+      return { reason: 'not-authorised' as const };
+    }
+    const online = observation.state.topics['online-state'];
+    if (observation.transport.status !== 'connected' || online?.session !== observation.transport.session
+      || online.value.onlineState !== 'connected') {
+      return { reason: 'not-ready' as const };
+    }
+    if (!['playing', 'paused'].includes(observation.playback)) {
+      return { reason: 'insufficient-state' as const };
+    }
+    return { observation };
+  }
+  #ownsCommand(c: Context, slot: Slot, target: PlaybackTarget, session: number): boolean {
+    return this.#current(c) && c.started && !this.#changing && c.production === slot && slot.active
+      && this.#status.authority === 'current' && c.uuid === target.accountUuid && slot.plan.accountUuid === target.accountUuid
+      && slot.status.phase === 'ready' && slot.status.connected && slot.status.session === session
+      && slot.plan.routes.some(r => r.routeId === target.routeId && r.macAddress === target.macAddress && playbackEligible(r));
+  }
+  #checkCommand(p: Command): boolean {
+    if (this.#commands.get(p.target.routeId) !== p) {
+      return false;
+    }
+    try {
+      const now = this.#now();
+      if (this.#commands.get(p.target.routeId) !== p) {
+        return false;
+      }
+      if (now >= p.deadline) {
+        this.#settleCommand(p, commandFailure('timeout', p.invoked)); return false;
+      }
+      const state = this.#commandState(p.context, p.slot, p.target, p.session);
+      const after = this.#now();
+      if (this.#commands.get(p.target.routeId) !== p) {
+        return false;
+      }
+      if (after >= p.deadline) {
+        this.#settleCommand(p, commandFailure('timeout', p.invoked)); return false;
+      }
+      const current = this.#commandObservation(p.slot, p.target);
+      if (state.reason || current.reason || !this.#ownsCommand(p.context, p.slot, p.target, p.session)) {
+        this.#settleCommand(p, commandFailure(state.reason === 'not-ready' ? 'interrupted' : 'invalidated', p.invoked));
+        return false;
+      }
+      return this.#commands.get(p.target.routeId) === p;
+    } catch {
+      this.#settleCommand(p, commandFailure('dependency', p.invoked)); return false;
+    }
+  }
+  #completeCommand(p: Command): void {
+    if (!this.#checkCommand(p) || !p.acknowledged || !p.evidence) {
+      return;
+    }
+    const state = p.slot.state.getDevice(p.target.routeId);
+    if (state?.playback === (p.action === 'play' ? 'playing' : 'paused') && state.freshness['playback/state'] === 'observed') {
+      this.#settleCommand(p, Object.freeze({ ok: true, outcome: 'confirmed' }));
+    }
+  }
+  #armCommand(p: Command): void {
+    if (!this.#checkCommand(p)) {
+      return;
+    }
+    const epoch = p.timerEpoch = {};
+    let installing = true;
+    const schedule = this.#options.scheduler?.schedule.bind(this.#options.scheduler) ?? ((callback: () => void, ms: number) => {
+      const timer = setTimeout(callback, ms); timer.unref(); return () => clearTimeout(timer);
+    });
+    const cleanup = schedule(() => {
+      if (this.#commands.get(p.target.routeId) !== p || p.timerEpoch !== epoch) {
+        return;
+      }
+      p.timerEpoch = undefined;
+      if (installing) {
+        this.#settleCommand(p, commandFailure('dependency', p.invoked)); return;
+      }
+      try {
+        this.#armCommand(p);
+      } catch {
+        this.#settleCommand(p, commandFailure('dependency', p.invoked));
+      }
+    }, Math.max(1, Math.ceil(p.deadline - this.#now())));
+    installing = false;
+    if (typeof cleanup !== 'function') {
+      throw new Error('Invalid command scheduler');
+    }
+    if (this.#commands.get(p.target.routeId) === p) {
+      p.cancelTimer = cleanup;
+    } else {
+      quiet(cleanup);
+    }
+  }
+  requestPlayback(raw: PlaybackTarget, action: PlaybackAction, options: { readonly signal?: AbortSignal } = {}): Promise<PlaybackRequestResult> {
+    if (this.#commandAdmission || this.#commandCleanup) {
+      return Promise.resolve(commandFailure('busy'));
+    }
+    this.#commandAdmission = true;
+    try {
+      if (this.#stopped) {
+        return Promise.resolve(commandFailure('stopped'));
+      }
+      if (this.#options.enablePlaybackCommands !== true) {
+        return Promise.resolve(commandFailure('not-authorised'));
+      }
+      const deadline = this.#now() + 5000;
+      if (deadline > Number.MAX_SAFE_INTEGER) {
+        return Promise.resolve(commandFailure('dependency'));
+      }
+      const target = raw && { accountUuid: raw.accountUuid, routeId: raw.routeId, macAddress: raw.macAddress };
+      const validText = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 256 && !/\s/u.test(v);
+      if (!target || !validText(target.accountUuid) || !validText(target.routeId) || !validText(target.macAddress)
+        || (action !== 'play' && action !== 'pause') || !options || typeof options !== 'object' || Array.isArray(options)) {
+        return Promise.resolve(commandFailure('invalid-input'));
+      }
+      const signal = options.signal;
+      if (signal !== undefined && !(signal instanceof AbortSignal)) {
+        return Promise.resolve(commandFailure('invalid-input'));
+      }
+      if (signal?.aborted) {
+        return Promise.resolve(commandFailure('cancelled'));
+      }
+      const c = this.#context, slot = c?.production;
+      if (!c || !slot) {
+        return Promise.resolve(commandFailure('not-authorised'));
+      }
+      if (this.#commands.has(target.routeId)) {
+        return Promise.resolve(commandFailure('busy'));
+      }
+      const state = this.#commandState(c, slot, target);
+      if (state.reason) {
+        return Promise.resolve(commandFailure(state.reason));
+      }
+      if (this.#now() >= deadline) {
+        return Promise.resolve(commandFailure('timeout'));
+      }
+      if (!this.#ownsCommand(c, slot, target, state.session!)) {
+        return Promise.resolve(commandFailure('invalidated'));
+      }
+      if (signal?.aborted) {
+        return Promise.resolve(commandFailure('cancelled'));
+      }
+      const current = this.#commandObservation(slot, target);
+      if (current.reason) {
+        return Promise.resolve(commandFailure(current.reason));
+      }
+      if (current.observation!.playback === (action === 'play' ? 'playing' : 'paused')
+        && current.observation!.freshness['playback/state'] === 'observed') {
+        return Promise.resolve(Object.freeze({ ok: true, outcome: 'already-satisfied' }));
+      }
+      return new Promise<PlaybackRequestResult>(resolve => {
+        const p: Command = { context: c, slot, target, action, session: state.session!, deadline,
+          controller: new AbortController(), resolve, invoked: false, acknowledged: false };
+        this.#commands.set(target.routeId, p);
+        try {
+          const abort = (): void => this.#settleCommand(p, commandFailure('cancelled', p.invoked));
+          p.removeAbort = () => signal?.removeEventListener('abort', abort);
+          signal?.addEventListener('abort', abort, { once: true });
+          if (this.#commands.get(target.routeId) !== p) {
+            quiet(p.removeAbort); return;
+          }
+          if (signal?.aborted) {
+            abort(); return;
+          }
+          this.#armCommand(p);
+          const lifecycle = slot.lifecycle, publish = lifecycle?.publishPlayback;
+          if (typeof publish !== 'function') {
+            throw new Error('Missing publisher');
+          }
+          if (!this.#checkCommand(p)) {
+            return;
+          }
+          p.invoked = true;
+          const pending = publish.call(lifecycle, target.routeId, action, { session: p.session, signal: p.controller.signal });
+          p.evidence = false; // Network observations after dispatch may precede the asynchronous PUBACK result.
+          void Promise.resolve(pending).then(rawResult => {
+            if (!this.#checkCommand(p)) {
+              return;
+            }
+            const result = playbackPublishResult(rawResult);
+            if (!result) {
+              this.#settleCommand(p, commandFailure('dependency', true));
+            } else if (!result.ok) {
+              this.#settleCommand(p, commandFailure(result.reason === 'capacity' ? 'busy' : result.reason, result.delivery === 'uncertain'));
+            } else {
+              p.acknowledged = true; this.#completeCommand(p);
+            }
+          }).catch(() => this.#settleCommand(p, commandFailure('dependency', p.invoked)));
+        } catch {
+          this.#settleCommand(p, commandFailure('dependency', p.invoked));
+        }
+      });
+    } catch {
+      return Promise.resolve(commandFailure('dependency'));
+    } finally {
+      this.#commandAdmission = false;
+    }
   }
   #remaining(): number {
     const now = this.#now();
@@ -177,12 +450,14 @@ class Coordinator implements AccountCoordinator {
   }
   #close(slot: Slot): void {
     slot.active = false;
+    this.#cancelCommands('invalidated', slot);
     slot.state.invalidate();
     quiet(() => slot.lifecycle?.stop());
   }
   #release(reason: CoordinatorFailure): void {
     const c = this.#context;
     this.#context = undefined; // Revoke every callback before abort/stop can reenter.
+    this.#cancelCommands(reason === 'stopped' ? 'stopped' : 'invalidated');
     if (!c) {
       return;
     }
@@ -253,17 +528,20 @@ class Coordinator implements AccountCoordinator {
       const c: Context = { key: Symbol(), controller: new AbortController(), experiments: new Map(), started: false };
       this.#context = c;
       this.#commissioning?.reset();
-      if (this.#commissioning) {
+      if (this.#commissioning || this.#options.enablePlaybackCommands === true) {
         let grantKey = '';
         this.#tokens.observeCredentials(snapshot => {
           if (!this.#current(c)) {
             return;
           }
+          if (snapshot.status.renewal === 'attention-required' || snapshot.status.renewal === 'stopped') {
+            this.#cancelCommands('invalidated');
+          }
           const grant = snapshot.grant;
           const key = grant ? JSON.stringify([snapshot.revision, grant.kind, grant.outcome, grant.accessChanged]) : '';
           if (key !== grantKey) {
             grantKey = key;
-            if (grant) {
+            if (grant && this.#commissioning) {
               quiet(() => this.#commissioning!.renewal(grant, () => this.#current(c)));
             }
           }
@@ -354,6 +632,8 @@ class Coordinator implements AccountCoordinator {
     let diagnosticKey = '';
     const lifecycle = (this.#options.lifecycleFactory ?? createMqttLifecycle)({
       tokenProvider: this.#tokens, accountUuid: plan.accountUuid, routes: plan.routes, contextSignal: c.controller.signal,
+      ...(this.#options.enablePlaybackCommands === true && plan.lane === 'production'
+        ? { playbackRouteIds: plan.routes.filter(playbackEligible).map(route => route.routeId) } : {}),
       clock: { now: () => this.#now() }, scheduler: this.#options.scheduler,
       onStatus: raw => {
         if (!live()) {
@@ -370,6 +650,11 @@ class Coordinator implements AccountCoordinator {
           }
           const newSession = status.phase === 'ready' && slot.status.session !== status.session;
           slot.status = status;
+          for (const p of [...this.#commands.values()]) {
+            if (p.slot === slot && (status.phase !== 'ready' || status.session !== p.session)) {
+              this.#settleCommand(p, commandFailure('interrupted', p.invoked));
+            }
+          }
           if (this.#commissioning) {
             quiet(() => {
               previouslyReady ||= status.phase === 'ready';
@@ -401,6 +686,15 @@ class Coordinator implements AccountCoordinator {
       onMessage: message => {
         if (live()) {
           const applied = bound.binding.onMessage(message);
+          const pending = this.#commands.get(message.routeId);
+          if (applied.accepted && plan.lane === 'production' && pending?.slot === slot && pending.context === c) {
+            // Capture acceptance before any clock/status callback can reenter. A duplicate cannot renew confirmation.
+            if (pending.evidence !== undefined && message.topic.endsWith('/playback/state')) {
+              pending.evidence = pending.invoked && message.session === pending.session && !message.retained && !message.duplicate
+                && slot.state.getDevice(message.routeId)?.playback === (pending.action === 'play' ? 'playing' : 'paused');
+            }
+            this.#completeCommand(pending);
+          }
           if (plan.lane === 'production' && applied.accepted && live()) {
             const session = slot.status.session;
             this.#productionNotice('observation',
@@ -435,8 +729,14 @@ class Coordinator implements AccountCoordinator {
       this.#fatal('invalidated'); return;
     }
     this.#status = { ...this.#status, authority: decision.plan?.routes.length ? decision.authority : 'none' };
+    if (this.#status.authority !== 'current') {
+      this.#cancelCommands('invalidated');
+    }
     // 6A's retain action compares routing identifiers; its approved plan may confirm a new model.
-    const modelChanged = c.production && decision.plan && !same(c.production.plan, decision.plan);
+    const modelChanged = c.production && decision.plan && (!same(c.production.plan, decision.plan)
+      // Opted-in command grants are immutable for a transport; changed capability requires a new slot.
+      || (this.#options.enablePlaybackCommands === true && c.production.plan.routes.some(route =>
+        playbackEligible(route) !== decision.plan!.routes.some(next => next.routeId === route.routeId && playbackEligible(next)))));
     if (decision.action !== 'retain' || modelChanged) {
       const old = c.production; c.production = undefined;
       if (old) {
