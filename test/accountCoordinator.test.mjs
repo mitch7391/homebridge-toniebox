@@ -1131,3 +1131,450 @@ test('production contract: real lifecycle buffered first message is visible befo
   connecting.resolve({ ok: true }); callbacks.onStatus({ phase: 'ready' }); await drain();
   assert.equal(changes.length, count); assert.equal(f.jobs.size, 0);
 });
+
+const playbackFailure = (reason, delivery = 'not-dispatched') => ({ ok: false, reason, delivery });
+const brokerAck = { ok: true, acknowledgement: 'broker' };
+const target = (id = 'SYNTHETIC_A') => ({ accountUuid: 'SYNTHETIC_ACCOUNT', routeId: id, macAddress: id + '_MAC' });
+async function playbackFixture(options = {}, boxes) {
+  const f = fixture({ options: { enablePlaybackCommands: true, ...options } });
+  if (boxes) {
+    f.boxes = boxes;
+  }
+  await f.begin();
+  const l = f.lifecycles[0], publications = [];
+  l.session = 1;
+  l.getStatus = () => ({ phase: l.phase, connected: l.phase === 'ready', ...(l.phase === 'ready' ? { session: l.session } : {}) });
+  l.publishPlayback = (routeId, action, request) => {
+    const d = deferred(); publications.push({ routeId, action, request, ...d }); return d.promise;
+  };
+  f.send = (category, value, metadata = {}) => {
+    const id = metadata.routeId ?? 'SYNTHETIC_A';
+    l.options.onMessage({ routeId: id, topic: 'external/toniebox/' + id + '_MAC/' + category,
+      payload: new TextEncoder().encode(JSON.stringify(value)), receivedAtMs: 1000,
+      session: l.session, retained: false, duplicate: false, qos: 1, ...metadata });
+  };
+  f.seed = (paused = true, retained = true, routeId = 'SYNTHETIC_A') => {
+    f.send('online-state', { onlineState: 'connected' }, { retained, routeId });
+    f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused }, { retained, routeId });
+  };
+  f.status = (phase, session = l.session) => {
+    l.phase = phase; l.session = session;
+    l.options.onStatus({ phase, connected: phase === 'ready', ...(phase === 'ready' ? { session } : {}) });
+  };
+  f.request = (action = 'play', options, identity = target()) => f.c.requestPlayback(identity, action, options);
+  return Object.assign(f, { l, publications });
+}
+test('playback is disabled by default and transport grants are production-profile-only', async () => {
+  const f = await playbackFixture({ enablePlaybackCommands: undefined }); f.seed();
+  assert.equal(f.l.options.playbackRouteIds, undefined);
+  assert.deepEqual(await f.request(), playbackFailure('not-authorised')); assert.equal(f.publications.length, 0);
+  const g = await playbackFixture(); assert.deepEqual(g.l.options.playbackRouteIds, ['SYNTHETIC_A']);
+});
+test('playback identity, action and cancellation inputs are validated', async () => {
+  const f = await playbackFixture(); f.seed();
+  for (const identity of [{ ...target(), accountUuid: 'OTHER' }, { ...target(), macAddress: 'OTHER' }, target('OTHER')]) {
+    assert.deepEqual(await f.request('play', {}, identity), playbackFailure('not-authorised'));
+  }
+  assert.deepEqual(await f.request('stop'), playbackFailure('invalid-input'));
+  assert.deepEqual(await f.request('play', { signal: {} }), playbackFailure('invalid-input'));
+  assert.deepEqual(await f.request('play', {}, null), playbackFailure('invalid-input'));
+  assert.equal(f.publications.length, 0);
+});
+test('unsupported validated state profiles and experimental routes never receive playback command permission', async () => {
+  const policy = { rules: [{ product: 'OTHER', generation: 'GEN', family: 'toniebox-lite', decision: 'validated',
+    protocol: 'ici-seven-state-topics', evidence: 'SYNTHETIC' }, { product: 'EXP', generation: 'GEN', family: 'unknown',
+    decision: 'experimental', protocol: 'ici-seven-state-topics', evidence: 'SYNTHETIC' }] };
+  const f = await playbackFixture({ policy }, [box(), box('OTHER', { product: 'OTHER', generation: 'GEN' }),
+    box('EXP', { product: 'EXP', generation: 'GEN' })]);
+  assert.deepEqual(f.l.options.playbackRouteIds, ['SYNTHETIC_A']);
+  assert.equal(f.lifecycles[1].options.playbackRouteIds, undefined);
+  for (const id of ['OTHER', 'EXP']) {
+    assert.deepEqual(await f.request('play', {}, target(id)), playbackFailure('not-authorised'));
+  }
+});
+test('offline, unknown, empty and inactive evidence cannot authorise playback', async () => {
+  const f = await playbackFixture();
+  assert.deepEqual(await f.request(), playbackFailure('not-ready'));
+  f.send('online-state', { onlineState: 'connected' });
+  for (const playback of [{}, { tonie: null }, { tonie: 'SYNTHETIC', paused: true, ended: true }]) {
+    f.send('playback/state', playback); assert.deepEqual(await f.request(), playbackFailure('insufficient-state'));
+  }
+  f.seed(); f.send('online-state', { onlineState: 'offline' });
+  assert.deepEqual(await f.request(), playbackFailure('not-ready')); assert.equal(f.publications.length, 0);
+});
+test('live already-satisfied requests do not publish; retained equivalents still require a command', async () => {
+  const f = await playbackFixture(); f.seed(false, false);
+  assert.deepEqual(await f.request('play'), { ok: true, outcome: 'already-satisfied' });
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true });
+  assert.deepEqual(await f.request('pause'), { ok: true, outcome: 'already-satisfied' }); assert.equal(f.publications.length, 0);
+  const g = await playbackFixture(); g.seed(false, true); const p = g.request();
+  assert.equal(g.publications.length, 1); g.publications[0].resolve(brokerAck); await drain();
+  g.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+});
+for (const order of ['ack-first', 'state-first']) {
+  test('physical confirmation requires PUBACK and accepted live state: ' + order, async () => {
+    const f = await playbackFixture(); f.seed(); const p = f.request(); let settled = false; void p.then(() => {
+      settled = true;
+    });
+    const state = () => f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+    if (order === 'ack-first') {
+      f.publications[0].resolve(brokerAck);
+    } else {
+      state();
+    }
+    await drain(); assert.equal(settled, false);
+    if (order === 'ack-first') {
+      state();
+    } else {
+      f.publications[0].resolve(brokerAck);
+    }
+    assert.deepEqual(await p, { ok: true, outcome: 'confirmed' }); assert.equal(f.publications[0].request.signal.aborted, true);
+  });
+}
+test('wrong-device, stale-session, duplicate, retained, invalid and non-playback messages cannot confirm', async () => {
+  const f = await playbackFixture({}, [box(), box('SECOND')]); f.seed(); f.seed(true, true, 'SECOND');
+  const p = f.request(); f.publications[0].resolve(brokerAck); let settled = false; void p.then(() => {
+    settled = true;
+  }); await drain();
+  const value = { tonie: 'SYNTHETIC_CONTENT', paused: false };
+  f.send('playback/state', value, { routeId: 'SECOND' });
+  f.send('playback/state', value, { session: 99 });
+  f.send('playback/state', value, { retained: true });
+  f.send('playback/state', value, { duplicate: true });
+  f.send('playback/state', value, { payload: new Uint8Array([0]) });
+  f.send('volume/state', { level: 5 }); await drain(); assert.equal(settled, false);
+  f.send('playback/state', value); // Accepted changed:false still confirms.
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+});
+test('PUBACK without confirmation expires at one five-second deadline; late state still updates read-only state', async () => {
+  const f = await playbackFixture(); f.seed(); const p = f.request(); f.publications[0].resolve(brokerAck); await drain();
+  const alarm = [...f.jobs].find(j => j.ms <= 5000); assert.equal(alarm.ms, 5000);
+  f.advance(5000); f.jobs.delete(alarm); alarm.fn();
+  assert.deepEqual(await p, playbackFailure('timeout', 'uncertain'));
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.equal(f.c.getDevice('SYNTHETIC_A').playback, 'playing'); alarm.fn();
+});
+test('deadline is checked on incoming evidence even if the timer has not run', async () => {
+  const f = await playbackFixture(); f.seed(); const p = f.request(); f.publications[0].resolve(brokerAck); await drain();
+  f.advance(5000); f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, playbackFailure('timeout', 'uncertain'));
+});
+test('competing device requests are busy and shared transport capacity is never queued', async () => {
+  const f = await playbackFixture({}, [box(), box('SECOND')]); f.seed(); f.seed(true, true, 'SECOND');
+  const p = f.request(); assert.deepEqual(await f.request('pause'), playbackFailure('busy'));
+  const q = f.request('play', {}, target('SECOND')); f.publications[1].resolve({ ok: false, reason: 'capacity', delivery: 'not-dispatched' });
+  assert.deepEqual(await q, playbackFailure('busy')); f.c.stop(); assert.deepEqual(await p, playbackFailure('stopped', 'uncertain'));
+  assert.equal(f.publications.length, 2);
+});
+test('caller cancellation distinguishes pre-dispatch from uncertain execution', async () => {
+  const f = await playbackFixture(); f.seed(); const a = new AbortController(); a.abort();
+  assert.deepEqual(await f.request('play', { signal: a.signal }), playbackFailure('cancelled')); assert.equal(f.publications.length, 0);
+  const b = new AbortController(), p = f.request('play', { signal: b.signal }); b.abort();
+  assert.deepEqual(await p, playbackFailure('cancelled', 'uncertain')); assert.equal(f.publications[0].request.signal.aborted, true);
+  f.publications[0].resolve(brokerAck); f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
+});
+for (const mode of ['clear', 'invalidate', 'stop', 'credentials', 'disconnect', 'session', 'attention', 'offline', 'policy']) {
+  test('pending playback revoked by ' + mode, async () => {
+    const f = await playbackFixture(); f.seed(); const p = f.request();
+    if (['clear', 'invalidate', 'stop'].includes(mode)) {
+      f.c[mode]();
+    }
+    if (mode === 'credentials') {
+      f.c.setCredentials({ username: 'NEXT', password: 'NEXT' });
+    }
+    if (mode === 'disconnect') {
+      f.status('connecting');
+    }
+    if (mode === 'session') {
+      f.status('ready', 2);
+    }
+    if (mode === 'attention') {
+      f.status('attention-required');
+    }
+    if (mode === 'offline') {
+      f.send('online-state', { onlineState: 'offline' });
+    }
+    if (mode === 'policy') {
+      f.c.setPolicy({ rules: [{ product: 'tb2', generation: 'tng', family: 'toniebox-2', decision: 'unsupported', evidence: 'SYNTHETIC' }] });
+    }
+    const result = await p; assert.equal(result.ok, false); assert.equal(result.delivery, 'uncertain');
+    assert.equal(f.publications[0].request.signal.aborted, true);
+    f.publications[0].resolve(brokerAck); await drain(); assert.equal(f.publications.length, 1);
+  });
+}
+test('incomplete discovery retains observation routing but revokes command authority', async () => {
+  const f = await playbackFixture(); f.seed(); const p = f.request();
+  f.boxesResult = { ok: false, error: { kind: 'invalid-response' } }; await f.c.discover();
+  assert.equal(f.c.getStatus().authority, 'last-known'); assert.deepEqual(await p, playbackFailure('invalidated', 'uncertain'));
+  assert.deepEqual(await f.request(), playbackFailure('not-authorised'));
+});
+test('broker refusal, definitely-unsent failure, rejected and malformed lifecycle results are sanitised', async () => {
+  const f = await playbackFixture(); f.seed();
+  for (const raw of [{ ok: false, reason: 'broker-refused', delivery: 'uncertain', secret: credentials },
+    { ok: false, reason: 'not-ready', delivery: 'not-dispatched' }, { ok: true }, null]) {
+    const p = f.request(); f.publications.at(-1).resolve(raw);
+    const result = await p;
+    assert.deepEqual(result, raw?.reason ? playbackFailure(raw.reason, raw.delivery) : playbackFailure('dependency', 'uncertain'));
+    assert.doesNotMatch(JSON.stringify([result, f.c.getStatus(), f.notices]), /SYNTHETIC|external\/|password|accessToken/);
+  }
+  const p = f.request(); f.publications.at(-1).reject(new Error('SYNTHETIC_PRIVATE'));
+  assert.deepEqual(await p, playbackFailure('dependency', 'uncertain'));
+});
+
+test('provisional confirmation is cleared by contradictory and duplicate playback evidence', async () => {
+  const f = await playbackFixture(); f.seed(); const p = f.request();
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true });
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, { duplicate: true });
+  f.publications[0].resolve(brokerAck); let settled = false; void p.then(() => {
+    settled = true;
+  }); await drain();
+  assert.equal(settled, false);
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+});
+
+test('playback received during preparation cannot confirm a subsequent dispatch', async () => {
+  const f = await playbackFixture(); f.seed(); const original = f.l.publishPlayback;
+  Object.defineProperty(f.l, 'publishPlayback', { get() {
+    f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); return original;
+  } });
+  const p = f.request(); f.publications[0].resolve(brokerAck); let settled = false; void p.then(() => {
+    settled = true;
+  }); await drain();
+  assert.equal(settled, false);
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+});
+
+for (const mode of ['getter-stop', 'getter-expiry', 'getter-invalid-status', 'getter-reentrant']) {
+  test('command admission rechecks after lifecycle callbacks: ' + mode, async () => {
+    const f = await playbackFixture(); f.seed(); const original = f.l.getStatus; let once = false, nested;
+    f.l.getStatus = () => {
+      if (!once) {
+        once = true;
+        if (mode === 'getter-stop') {
+          f.c.stop();
+        }
+        if (mode === 'getter-expiry') {
+          f.advance(5000);
+        }
+        if (mode === 'getter-invalid-status') {
+          return { phase: 'ready', connected: true };
+        }
+        if (mode === 'getter-reentrant') {
+          nested = f.request();
+        }
+      }
+      return original();
+    };
+    const p = f.request();
+    if (nested) {
+      assert.deepEqual(await nested, playbackFailure('busy')); f.c.stop();
+    }
+    assert.equal((await p).ok, false);
+    assert.equal(f.publications.length, nested ? 1 : 0);
+  });
+}
+
+for (const mode of ['throw', 'no-cleanup', 'synchronous', 'stop', 'early']) {
+  test('command scheduler failure and early callback safety: ' + mode, async () => {
+    let custom = false, f; const jobs = new Set();
+    const scheduler = { schedule(fn, ms) {
+      if (custom) {
+        if (mode === 'throw') {
+          throw new Error('SYNTHETIC');
+        }
+        if (mode === 'no-cleanup') {
+          return undefined;
+        }
+        if (mode === 'synchronous') {
+          fn(); return () => {};
+        }
+        if (mode === 'stop') {
+          f.c.stop(); return () => {};
+        }
+      }
+      const j = { fn, ms }; jobs.add(j); return () => jobs.delete(j);
+    } };
+    f = await playbackFixture({ scheduler }); f.seed(); custom = true;
+    const p = f.request();
+    if (mode === 'early') {
+      const alarm = [...jobs].find(j => j.ms === 5000); jobs.delete(alarm); f.advance(2000); alarm.fn();
+      assert.ok([...jobs].some(j => j.ms === 3000));
+      f.advance(3000); const next = [...jobs].find(j => j.ms === 3000); jobs.delete(next); next.fn();
+      assert.deepEqual(await p, playbackFailure('timeout', 'uncertain'));
+    } else {
+      assert.equal((await p).ok, false); assert.equal(f.publications.length, 0);
+    }
+    f.c.stop(); assert.equal(jobs.size, 0);
+  });
+}
+
+test('cancellation cleanup rejects reentrant admission and removes caller listeners', async () => {
+  const { getEventListeners } = await import('node:events');
+  const f = await playbackFixture(); f.seed(); const controller = new AbortController();
+  const p = f.request('play', { signal: controller.signal }); let nested;
+  f.publications[0].request.signal.addEventListener('abort', () => {
+    nested = f.request();
+  });
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 1); controller.abort();
+  assert.deepEqual(await p, playbackFailure('cancelled', 'uncertain'));
+  assert.deepEqual(await nested, playbackFailure('busy'));
+  assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+  assert.equal(f.publications.length, 1); assert.equal([...f.jobs].filter(j => j.ms <= 5000).length, 0);
+});
+
+for (const mode of ['removed', 'mac', 'account']) {
+  test('discovery revocation invalidates pending command: ' + mode, async () => {
+    const f = await playbackFixture(); f.seed(); const p = f.request();
+    if (mode === 'removed') {
+      f.boxes = [];
+    }
+    if (mode === 'mac') {
+      f.boxes = [box(undefined, { macAddress: 'CHANGED_MAC' })];
+    }
+    if (mode === 'account') {
+      f.account = { id: 'NEW_ACCOUNT', identitySource: 'uuid' };
+    }
+    await f.c.discover(); assert.deepEqual(await p, playbackFailure('invalidated', 'uncertain'));
+    f.publications[0].resolve(brokerAck); f.seed(false, false); await drain(); assert.equal(f.publications.length, 1);
+  });
+}
+
+test('terminal token renewal cancels confirmation after PUBACK while preserving receive-only readiness', async () => {
+  let refreshes = 0;
+  const f = await playbackFixture({ authClient: {
+    login: async () => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH',
+      tokenType: 'Bearer', expiresInSeconds: 300 } }),
+    refresh: async () => {
+      refreshes++; return { ok: false, error: { kind: 'http', status: 401 } };
+    },
+  } });
+  f.seed(); f.advance(239000); const p = f.request(); f.publications[0].resolve(brokerAck); await drain();
+  const renewal = [...f.jobs].find(j => j.ms === 240000); f.advance(1000); f.jobs.delete(renewal); renewal.fn(); await drain();
+  assert.equal(refreshes, 1); assert.deepEqual(await p, playbackFailure('invalidated', 'uncertain'));
+  assert.equal(f.c.getStatus().connections[0].status.phase, 'ready');
+  assert.deepEqual(await f.request(), playbackFailure('not-ready'));
+});
+
+test('real token manager and lifecycle compose confirmation, capacity and proactive cancellation without replay', async () => {
+  const transports = [], slots = []; let refreshes = 0;
+  const grant = () => ({ ok: true, tokens: { accessToken: 'SYNTHETIC_ACCESS_' + refreshes,
+    refreshToken: 'SYNTHETIC_REFRESH_' + refreshes, tokenType: 'Bearer', expiresInSeconds: 300 } });
+  const f = fixture({ options: { enablePlaybackCommands: true,
+    authClient: { login: async () => grant(), refresh: async () => {
+      refreshes++; return grant();
+    } },
+    lifecycleFactory: options => {
+      slots.push(options);
+      return createMqttLifecycle({ ...options, jitter: () => 0.5, transportFactory: hooks => {
+        const publications = [];
+        const t = { hooks, publications, closed: false, getStatus: () => ({ phase: 'idle' }),
+          close() {
+            this.closed = true;
+          },
+          connect(auth, routes, permissions) {
+            this.permissions = permissions; assert.ok(transports.filter(p => p !== this).every(p => p.closed));
+            hooks.onStatus({ phase: 'ready' }); return Promise.resolve({ ok: true });
+          },
+          publishPlayback(routeId, action, options) {
+            const d = deferred(); publications.push({ routeId, action, options, ...d }); return d.promise;
+          },
+        };
+        transports.push(t); return t;
+      } });
+    },
+  } });
+  f.boxes = [box(), box('SECOND')]; await f.begin(); await drain();
+  const send = (transport, id, category, value, retained = true) => transport.hooks.onMessage({ routeId: id,
+    topic: 'external/toniebox/' + id + '_MAC/' + category, payload: new TextEncoder().encode(JSON.stringify(value)),
+    retained, duplicate: false, qos: 1, receivedAtMs: 1000 });
+  const seed = t => {
+    for (const id of ['SYNTHETIC_A', 'SECOND']) {
+      send(t, id, 'online-state', { onlineState: 'connected' });
+      send(t, id, 'playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true });
+    }
+  };
+  const first = transports[0]; seed(first);
+  assert.deepEqual(first.permissions.playbackRouteIds, ['SECOND', 'SYNTHETIC_A']);
+  const p = f.c.requestPlayback(target(), 'play');
+  assert.deepEqual(await f.c.requestPlayback(target('SECOND'), 'play'), playbackFailure('busy'));
+  assert.equal(first.publications.length, 1);
+  send(first, 'SYNTHETIC_A', 'playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, false);
+  first.publications[0].resolve(brokerAck);
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+  f.advance(239000); const q = f.c.requestPlayback(target(), 'pause');
+  first.publications[1].resolve(brokerAck); await drain();
+  const renewal = [...f.jobs].find(j => j.ms === 240000); f.advance(1000); f.jobs.delete(renewal); renewal.fn(); await drain();
+  assert.equal((await q).delivery, 'uncertain'); assert.equal(transports.length, 2); assert.equal(slots.length, 1);
+  const second = transports[1]; assert.equal(second.publications.length, 0); seed(second);
+  const r = f.c.requestPlayback(target(), 'play'); second.publications[0].resolve(brokerAck); await drain();
+  send(first, 'SYNTHETIC_A', 'playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, false);
+  let settled = false; void r.then(() => {
+    settled = true;
+  }); await drain(); assert.equal(settled, false);
+  send(second, 'SYNTHETIC_A', 'playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }, false);
+  assert.deepEqual(await r, { ok: true, outcome: 'confirmed' });
+  assert.equal(refreshes, 1); assert.deepEqual(f.calls, ['account', 'households', 'boxes']);
+  f.c.stop(); assert.equal(f.jobs.size, 0); assert.ok(transports.every(t => t.closed));
+});
+
+test('fresh validated routing with withdrawn playback capability revokes immutable command grants', async () => {
+  const policy = { rules: [{ product: 'tb2', generation: 'tng', family: 'toniebox-2', decision: 'validated',
+    protocol: 'ici-seven-state-topics', evidence: 'SYNTHETIC' }] };
+  const f = await playbackFixture({ policy }); f.seed(); const p = f.request();
+  f.boxes = [box(undefined, { features: [] })]; await f.c.discover();
+  assert.deepEqual(await p, playbackFailure('invalidated', 'uncertain'));
+  assert.equal(f.c.getStatus().authority, 'current'); assert.equal(f.l.stops, 1);
+  assert.deepEqual(f.lifecycles[1].options.playbackRouteIds, []);
+  assert.deepEqual(await f.request(), playbackFailure('not-authorised'));
+});
+
+for (const invalid of [NaN, -1, Number.MAX_SAFE_INTEGER]) {
+  test('invalid or exhausted monotonic clock cannot dispatch: ' + invalid, async () => {
+    let time = 0;
+    const f = await playbackFixture({ clock: { now: () => ({ monotonicMs: time, wallMs: 0 }) } }); f.seed(); time = invalid;
+    assert.deepEqual(await f.request(), playbackFailure('dependency')); assert.equal(f.publications.length, 0);
+  });
+}
+
+test('clock reentrancy cannot use a stale no-op snapshot or survive ownership invalidation', async () => {
+  let hook;
+  const f = await playbackFixture({ clock: { now: () => {
+    const run = hook; hook = undefined; run?.(); return { monotonicMs: 0, wallMs: 0 };
+  } } });
+  f.seed(false, false);
+  const original = f.l.getStatus; let once = false;
+  f.l.getStatus = () => {
+    if (!once) {
+      once = true; hook = () => f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true });
+    }
+    return original();
+  };
+  const p = f.request(); assert.equal(f.publications.length, 1); f.c.stop();
+  assert.deepEqual(await p, playbackFailure('stopped', 'uncertain'));
+});
+
+test('caller identity mutation cannot redirect an admitted command', async () => {
+  const f = await playbackFixture(); f.seed(); const identity = target(), p = f.request('play', {}, identity);
+  identity.accountUuid = 'OTHER'; identity.routeId = 'OTHER'; identity.macAddress = 'OTHER';
+  f.publications[0].resolve(brokerAck); await drain();
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+  assert.equal(f.publications[0].routeId, 'SYNTHETIC_A');
+});
+
+test('synchronous publication admission cannot launder pre-dispatch state into confirmation', async () => {
+  const f = await playbackFixture(); f.seed(); const original = f.l.publishPlayback;
+  f.l.publishPlayback = (...args) => {
+    f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); return original(...args);
+  };
+  const p = f.request(); f.publications[0].resolve(brokerAck); let settled = false; void p.then(() => {
+    settled = true;
+  }); await drain();
+  assert.equal(settled, false);
+  f.send('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false });
+  assert.deepEqual(await p, { ok: true, outcome: 'confirmed' });
+});

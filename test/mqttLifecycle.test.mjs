@@ -1244,3 +1244,114 @@ test('terminal credential status projects a changing reason getter without priva
   await f.start(); assert.equal(f.tokenCalls.length, 0); assert.equal(reads, 1);
   assert.deepEqual(f.lifecycle.getStatus().error, { kind: 'token', tokenFailure: 'authentication-failed' });
 });
+
+const commandFailure = (reason, delivery = 'not-dispatched') => ({ ok: false, reason, delivery });
+const acknowledged = { ok: true, acknowledgement: 'broker' };
+async function commandFixture(t, options = {}) {
+  const f = fixture(t, { playbackRouteIds: [routePlan[0].routeId], ...options });
+  await f.start(); established(f);
+  const publications = [];
+  f.transport.publishPlayback = (routeId, action, request) => {
+    const pending = deferred(); publications.push({ routeId, action, request, ...pending }); return pending.promise;
+  };
+  return { ...f, publications, publish: (action = 'play', request = {}) =>
+    f.lifecycle.publishPlayback(routePlan[0].routeId, action, { session: f.lifecycle.getStatus().session, ...request }) };
+}
+test('playback grants default empty and explicit grants are copied into every connection', async t => {
+  const disabled = await commandFixture(t, { playbackRouteIds: undefined });
+  assert.equal(disabled.transport.calls[0].options.playbackRouteIds, undefined);
+  assert.deepEqual(await disabled.publish(), commandFailure('not-authorised')); assert.equal(disabled.publications.length, 0);
+  const permission = [routePlan[0].routeId], f = await commandFixture(t, { playbackRouteIds: permission });
+  permission[0] = 'OTHER'; assert.deepEqual(f.transport.calls[0].options.playbackRouteIds, [routePlan[0].routeId]);
+  const p = f.publish('pause'); assert.equal(f.publications[0].routeId, routePlan[0].routeId); assert.equal(f.publications[0].action, 'pause');
+  f.publications[0].resolve({ ...acknowledged, private: secret }); assert.deepEqual(await p, acknowledged);
+});
+test('playback requires the current ready session and valid inputs', async t => {
+  const f = fixture(t, { playbackRouteIds: [routePlan[0].routeId] });
+  assert.deepEqual(await f.lifecycle.publishPlayback(routePlan[0].routeId, 'play', { session: 1 }), commandFailure('not-ready'));
+  await f.start(); established(f);
+  for (const [route, action, options, reason] of [
+    ['UNKNOWN', 'play', { session: 1 }, 'not-authorised'],
+    [routePlan[0].routeId, 'stop', { session: 1 }, 'invalid-input'],
+    [routePlan[0].routeId, 'play', { session: 2 }, 'not-ready'],
+    [routePlan[0].routeId, 'play', { session: 1, signal: {} }, 'invalid-input'],
+    [routePlan[0].routeId, 'play', {}, 'invalid-input'],
+  ]) {
+    assert.deepEqual(await f.lifecycle.publishPlayback(route, action, options), commandFailure(reason));
+  }
+});
+test('invalid playback permission subsets fail closed without connecting', t => {
+  const f = fixture(t);
+  for (const permission of [null, {}, ['OTHER'], [routePlan[0].routeId, routePlan[0].routeId]]) {
+    assert.throws(() => createMqttLifecycle({ ...f.options, playbackRouteIds: permission }), /Invalid MQTT lifecycle options/);
+  }
+});
+test('publication capacity is bounded and caller cancellation settles before uncooperative transport', async t => {
+  const f = await commandFixture(t), a = new AbortController(); a.abort();
+  assert.deepEqual(await f.publish('play', { signal: a.signal }), commandFailure('cancelled')); assert.equal(f.publications.length, 0);
+  const b = new AbortController(), p = f.publish('play', { signal: b.signal });
+  assert.deepEqual(await f.publish(), commandFailure('capacity'));
+  b.abort(); assert.deepEqual(await p, commandFailure('cancelled', 'uncertain'));
+  assert.equal(f.publications[0].request.signal.aborted, true); assert.equal(getEventListeners(b.signal, 'abort').length, 0);
+  f.publications[0].resolve(acknowledged); await flush(); assert.equal(f.publications.length, 1);
+});
+for (const kind of ['proactive', 'transport', 'recovery', 'stop', 'context', 'attention']) {
+  test('publication cancelled on ' + kind + ' and never replayed', async t => {
+    const f = await commandFixture(t), p = f.publish();
+    if (kind === 'proactive') {
+      f.setTime(240000); f.renew(2); await flush();
+    }
+    if (kind === 'transport') {
+      f.transport.fail();
+    }
+    if (kind === 'recovery') {
+      refusal(f);
+    }
+    if (kind === 'stop') {
+      f.lifecycle.stop();
+    }
+    if (kind === 'context') {
+      f.context.abort();
+    }
+    if (kind === 'attention') {
+      f.renew(1, { renewal: 'attention-required', reason: 'authentication-failed' });
+    }
+    assert.deepEqual(await p, commandFailure('interrupted', 'uncertain'));
+    assert.equal(f.publications[0].request.signal.aborted, true);
+    f.publications[0].resolve(acknowledged); await flush(); assert.equal(f.publications.length, 1);
+    if (kind === 'proactive') {
+      const current = f.transports.at(-1); current.ready(); current.pending.resolve({ ok: true });
+      assert.deepEqual(current.calls[0].options.playbackRouteIds, [routePlan[0].routeId]);
+      assert.deepEqual(await f.lifecycle.publishPlayback(routePlan[0].routeId, 'play', { session: 1 }), commandFailure('not-ready'));
+    }
+    if (kind === 'attention') {
+      assert.equal(f.lifecycle.getStatus().phase, 'ready');
+    }
+  });
+}
+test('transport failures are projected; malformed and rejected results cannot leak private data', async t => {
+  const f = await commandFixture(t);
+  for (const raw of [null, { ok: true }, { ok: false, reason: 'PRIVATE', delivery: 'uncertain' },
+    { ok: false, reason: 'broker-refused', delivery: 'uncertain', private: secret },
+    { ok: false, reason: 'capacity', delivery: 'not-dispatched', private: secret }]) {
+    const p = f.publish(); f.publications.at(-1).resolve(raw);
+    const result = await p;
+    assert.deepEqual(result, raw?.reason === 'broker-refused' ? commandFailure('broker-refused', 'uncertain')
+      : raw?.reason === 'capacity' ? commandFailure('capacity') : commandFailure('dependency', 'uncertain'));
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE|SYNTHETIC/);
+  }
+  const p = f.publish(); f.publications.at(-1).reject(new Error(secret));
+  assert.deepEqual(await p, commandFailure('dependency', 'uncertain'));
+});
+test('reentrant transport getter and publishing callbacks cannot retain retired session authority', async t => {
+  const f = await commandFixture(t);
+  Object.defineProperty(f.transport, 'publishPlayback', { get() {
+    f.lifecycle.stop(); return () => assert.fail('No dispatch');
+  } });
+  assert.deepEqual(await f.publish(), commandFailure('interrupted'));
+  const g = await commandFixture(t);
+  g.transport.publishPlayback = () => {
+    g.lifecycle.stop(); return Promise.resolve(acknowledged);
+  };
+  assert.deepEqual(await g.publish(), commandFailure('interrupted', 'uncertain'));
+});

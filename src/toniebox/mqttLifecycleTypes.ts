@@ -1,4 +1,4 @@
-import type { MqttFailure, MqttMessage, MqttRoute, MqttTransport, MqttTransportOptions } from './mqttTransportTypes.js';
+import type { MqttFailure, MqttMessage, MqttRoute, MqttTransport, MqttTransportOptions, PlaybackAction, PlaybackPublishResult } from './mqttTransportTypes.js';
 import type { TokenManager, TokenManagerFailureKind } from './tokenManagerTypes.js';
 
 export interface MqttLifecycleFailure {
@@ -26,6 +26,8 @@ export interface MqttLifecycleOptions {
   readonly accountUuid: string;
   /** Coordinator-approved authority, copied at construction. Never inferred from discovery. */
   readonly routes: readonly MqttRoute[];
+  /** Trusted command grant, copied and checked against routes; empty by default. */
+  readonly playbackRouteIds?: readonly string[];
   /** Abort BEFORE changing credentials. A replacement context requires a new lifecycle. */
   readonly contextSignal: AbortSignal;
   /** Private data delivery; never a diagnostic callback. */
@@ -43,6 +45,9 @@ export interface MqttLifecycle {
   /** Non-blocking and idempotent. Attention and stopped instances cannot restart. */
   start(): void;
   getStatus(): MqttLifecycleStatus;
+  /** Broker outcome only. The required session prevents reuse of retired delivery authority. */
+  publishPlayback(routeId: string, action: PlaybackAction,
+    options: { readonly session: number; readonly signal?: AbortSignal }): Promise<PlaybackPublishResult>;
   /** Terminal, prompt, idempotent. Never stops or clears the shared token provider. */
   stop(): void;
 }
