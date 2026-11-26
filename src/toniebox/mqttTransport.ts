@@ -12,6 +12,8 @@ const PACKET_LIMIT = 128 * 1024;
 const PAYLOAD_LIMIT = 64 * 1024;
 const BUFFER_LIMIT = 1024 * 1024;
 const PUBLISH_ACK_MS = 3000;
+// Provisional broker queue lifetime; not cancellation or a physical execution deadline.
+const PLAYBACK_EXPIRY_SECONDS = 3;
 const COMMAND_PAYLOAD_LIMIT = 64;
 const PUBACK_REASONS = new Set([0, 16, 128, 131, 135, 144, 145, 151, 153]);
 interface Publication {
@@ -290,7 +292,8 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
     }
     // A callback without a matching PUBACK is not success; the deadline still applies.
   };
-  function onPacketSend(packet: { cmd: string; topic?: string; payload?: unknown; qos?: number; retain?: boolean; messageId?: number }): void {
+  function onPacketSend(packet: { cmd: string; topic?: string; payload?: unknown; qos?: number;
+    retain?: boolean; messageId?: number; properties?: unknown }): void {
     const p = publication;
     try {
       if (packet.cmd !== 'publish') {
@@ -299,8 +302,14 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
       if (!p || !p.invoked || !publicationCurrent(p)) {
         finish({ kind: 'protocol' }); return;
       }
+      const properties = packet.properties;
+      const expiry = properties && typeof properties === 'object' && !Array.isArray(properties)
+        ? (properties as { messageExpiryInterval?: unknown }).messageExpiryInterval : undefined;
+      if (!publicationCurrent(p)) {
+        return;
+      }
       const id = packet.messageId;
-      if (p.packetId !== undefined || !Number.isInteger(id) || id === undefined || id < 1 || id > 65535
+      if (expiry !== PLAYBACK_EXPIRY_SECONDS || p.packetId !== undefined || !Number.isInteger(id) || id === undefined || id < 1 || id > 65535
         || usedPublishIds.has(id) || packet.topic !== p.topic || packet.qos !== 1 || packet.retain !== false
         || !(typeof packet.payload === 'string' || Buffer.isBuffer(packet.payload))
         || packet.payload.toString() !== p.payload) {
@@ -624,7 +633,7 @@ export function createMqttTransport(options: MqttTransportOptions): MqttTranspor
               return;
             }
             p.invoked = true; // Calling the library makes downstream delivery uncertain, even if it throws.
-            owner.publish(topic, payload, { qos: 1, retain: false }, error => {
+            owner.publish(topic, payload, { qos: 1, retain: false, properties: { messageExpiryInterval: PLAYBACK_EXPIRY_SECONDS } }, error => {
               if (publication !== p || p.callbackDone) {
                 return;
               }
