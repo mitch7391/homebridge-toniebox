@@ -118,7 +118,7 @@ A standalone discovery runner brings together the existing token manager and RES
 
 Each discovery run uses a single access token, retrieves household and device information sequentially, and operates within defined time limits. It also handles temporary connection failures conservatively, respects cloud rate limits, and preserves partial discovery results when enumeration cannot be completed.
 
-Additional safeguards protect against overlapping discovery operations, outdated responses, stale MQTT callbacks, credential changes, duplicate device identities and ambiguous routing information. Cancellation and shutdown are handled without allowing previous discovery results to affect a new account session.
+Additional safeguards protect against overlapping discovery operations, outdated responses, duplicate device identities and ambiguous routing information. Cancellation and shutdown are handled without allowing previous discovery results to affect a new account session.
 
 Increment 4B delivered an independent discovery runner. Homebridge startup integration and accessory publication followed in later increments.
 
