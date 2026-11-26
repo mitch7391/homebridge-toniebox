@@ -401,6 +401,7 @@ Here's the current plan for development:
   - [ ] **8B.3:** Authorised playback control and HomeKit integration
     - [x] **8B.3A:** Guarded MQTT playback publishing transport
     - [x] **8B.3B:** Authorised command coordination and physical-state confirmation
+    - [x] **8B.3B follow-up:** MQTT v5 playback message expiry safeguard
     - [ ] **8B.3C:** Writable SmartSpeaker playback actions and Playback Switch
 - [ ] **Future:** Beta testing and refinement
 

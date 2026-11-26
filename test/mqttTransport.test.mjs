@@ -1107,7 +1107,8 @@ for (const action of ['play', 'pause']) {
   test('exact guarded wire request: ' + action, async t => {
     const f = await playbackFixture(t); const result = f.publish(action);
     assert.deepEqual(f.sent[0].packet, { cmd: 'publish', topic: 'external/toniebox/SYNTHETIC-MAC/app-control/playback',
-      payload: action === 'play' ? '{"action":"start"}' : '{"action":"pause"}', qos: 1, retain: false, messageId: 100 });
+      payload: action === 'play' ? '{"action":"start"}' : '{"action":"pause"}', qos: 1, retain: false, messageId: 100,
+      properties: { messageExpiryInterval: 3 } });
     assert.equal(Object.keys(f.client.request).length, 7);
     f.ackPublish(); assert.deepEqual(await result, brokerAccepted); assert.equal(f.jobs.size, 0);
   });
@@ -1276,29 +1277,32 @@ async function realPlaybackFixture(t) {
     },
   };
 }
-for (const [code, reason] of [[0, undefined], [16, 'no-subscribers'], [128, 'broker-refused'], [135, 'broker-refused'], [151, 'broker-refused']]) {
-  test('real MQTT.js outgoing QoS-1 PUBACK classification ' + code, async t => {
-    const f = await realPlaybackFixture(t);
-    const respond = f.socket.respond;
-    f.socket.respond = p => {
-      respond(p);
-      if (p.cmd === 'publish') {
-        queueMicrotask(() => f.socket.receive({ cmd: 'puback', messageId: p.messageId, reasonCode: code }));
-      }
-    };
-    const result = await f.publish();
-    assert.deepEqual(result, reason ? publishFailed(reason, 'uncertain') : brokerAccepted);
-    const [p] = f.commands();
-    assert.equal(p.topic, 'external/toniebox/SYNTHETIC-MAC/app-control/playback');
-    assert.equal(p.payload.toString(), '{"action":"start"}'); assert.equal(p.qos, 1); assert.equal(p.retain, false);
-    assert.equal(p.dup, false); assert.equal(f.socket.sent.filter(p => p.cmd === 'subscribe').length, 1);
-    assert.equal(f.client.options.reconnectPeriod, 0); assert.equal(f.client.options.resubscribe, false);
-    assert.equal(f.client.options.clean, true); assert.equal(f.client.options.properties.sessionExpiryInterval, 0);
-    assert.equal(f.adapter.getStatus().phase, 'ready'); assert.equal(f.jobs.size, 0);
-    f.socket.receive({ cmd: 'publish', topic, payload: Buffer.from('still receiving'), qos: 1, messageId: 500, retain: false, dup: false });
-    await flush(); assert.equal(f.messages.at(-1).payload.length, 15);
-    assert.ok(f.socket.sent.some(p => p.cmd === 'puback' && p.messageId === 500));
-  });
+for (const action of ['play', 'pause']) {
+  for (const [code, reason] of [[0, undefined], [16, 'no-subscribers'], [128, 'broker-refused'], [135, 'broker-refused'], [151, 'broker-refused']]) {
+    test('real MQTT.js expiring ' + action + ' QoS-1 PUBACK classification ' + code, async t => {
+      const f = await realPlaybackFixture(t);
+      const respond = f.socket.respond;
+      f.socket.respond = p => {
+        respond(p);
+        if (p.cmd === 'publish') {
+          queueMicrotask(() => f.socket.receive({ cmd: 'puback', messageId: p.messageId, reasonCode: code }));
+        }
+      };
+      const result = await f.publish(action);
+      assert.deepEqual(result, reason ? publishFailed(reason, 'uncertain') : brokerAccepted);
+      const [p] = f.commands();
+      assert.equal(p.topic, 'external/toniebox/SYNTHETIC-MAC/app-control/playback');
+      assert.equal(p.payload.toString(), action === 'play' ? '{"action":"start"}' : '{"action":"pause"}');
+      assert.deepEqual(p.properties, { messageExpiryInterval: 3 }); assert.equal(p.qos, 1); assert.equal(p.retain, false);
+      assert.equal(p.dup, false); assert.equal(f.socket.sent.filter(p => p.cmd === 'subscribe').length, 1);
+      assert.equal(f.client.options.reconnectPeriod, 0); assert.equal(f.client.options.resubscribe, false);
+      assert.equal(f.client.options.clean, true); assert.equal(f.client.options.properties.sessionExpiryInterval, 0);
+      assert.equal(f.adapter.getStatus().phase, 'ready'); assert.equal(f.jobs.size, 0);
+      f.socket.receive({ cmd: 'publish', topic, payload: Buffer.from('still receiving'), qos: 1, messageId: 500, retain: false, dup: false });
+      await flush(); assert.equal(f.messages.at(-1).payload.length, 15);
+      assert.ok(f.socket.sent.some(p => p.cmd === 'puback' && p.messageId === 500));
+    });
+  }
 }
 for (const mode of ['timeout', 'abort', 'close', 'disconnect']) {
   test('real pending publish ' + mode + ' removes authority and never replays', async t => {
@@ -1479,3 +1483,55 @@ test('duplicate permissions fail even within the approved route-count bound', as
     { playbackRouteIds: [routes[0].routeId, routes[0].routeId] });
   assert.equal(result.error.kind, 'invalid-input'); assert.equal(f.client, undefined);
 });
+
+for (const properties of [undefined, null, false, 'SYNTHETIC_PRIVATE', [], {},
+  { messageExpiryInterval: undefined }, { messageExpiryInterval: 0 }, { messageExpiryInterval: 2 },
+  { messageExpiryInterval: 5 }, { messageExpiryInterval: '3' }, { messageExpiryInterval: NaN }]) {
+  test('missing or malformed playback expiry fails closed: ' + JSON.stringify(properties), async t => {
+    const f = await playbackFixture(t);
+    f.client.publish = (topic, payload, options, callback) => {
+      assert.deepEqual(options.properties, { messageExpiryInterval: 3 });
+      f.client.emit('packetsend', { cmd: 'publish', topic, payload, ...options, properties, messageId: 100 });
+      f.client.emit('packetreceive', { cmd: 'puback', messageId: 100, reasonCode: 0 }); callback(null);
+      return f.client;
+    };
+    const result = await f.publish();
+    assert.deepEqual(result, publishFailed('dependency', 'uncertain'));
+    assert.equal(f.transport.getStatus().phase, 'closed'); assert.equal(f.jobs.size, 0);
+    assert.deepEqual(await f.publish(), publishFailed('closed'));
+    assert.doesNotMatch(JSON.stringify([result, f.transport.getStatus()]), /SYNTHETIC|external\/|action|token|password/i);
+  });
+}
+for (const mode of ['properties-throw', 'expiry-throw', 'expiry-close', 'read-once']) {
+  test('expiry packet getters are contained and cannot restore authority: ' + mode, async t => {
+    const f = await playbackFixture(t); let propertyReads = 0, expiryReads = 0;
+    f.client.publish = (topic, payload, options, callback) => {
+      const packet = { cmd: 'publish', topic, payload, ...options, messageId: 100,
+        get properties() {
+          propertyReads++;
+          if (mode === 'properties-throw') {
+            throw new Error('SYNTHETIC_PRIVATE');
+          }
+          return { get messageExpiryInterval() {
+            expiryReads++;
+            if (mode === 'expiry-throw') {
+              throw new Error('SYNTHETIC_PRIVATE');
+            }
+            if (mode === 'expiry-close') {
+              f.transport.close();
+            }
+            return expiryReads === 1 ? 3 : 999;
+          } };
+        },
+      };
+      f.client.emit('packetsend', packet);
+      f.client.emit('packetreceive', { cmd: 'puback', messageId: 100, reasonCode: 0 }); callback(null);
+      return f.client;
+    };
+    const result = await f.publish();
+    assert.deepEqual(result, mode === 'read-once' ? brokerAccepted : publishFailed(mode === 'expiry-close' ? 'closed' : 'dependency', 'uncertain'));
+    assert.equal(propertyReads, 1); assert.equal(expiryReads, mode === 'properties-throw' ? 0 : 1);
+    assert.equal(f.jobs.size, 0);
+    assert.doesNotMatch(JSON.stringify([result, f.transport.getStatus()]), /SYNTHETIC|external\/|action|token|password/i);
+  });
+}
