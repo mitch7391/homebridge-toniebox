@@ -1,8 +1,16 @@
 import type { API, Characteristic, PlatformAccessory } from 'homebridge';
-import type { AccountCoordinator, ProductionInventory } from './toniebox/accountCoordinatorTypes.js';
+import type { AccountCoordinator, PlaybackTarget, ProductionInventory } from './toniebox/accountCoordinatorTypes.js';
 import { PLUGIN_NAME } from './settings.js';
 
-export type ProductionReader = Pick<AccountCoordinator, 'getProductionInventory' | 'getDevice'>;
+export type ProductionReader = Pick<AccountCoordinator, 'getProductionInventory' | 'getDevice'>
+  & Partial<Pick<AccountCoordinator, 'requestPlayback'>>;
+export interface PlaybackPresentationOptions { readonly enablePlaybackCommands?: boolean }
+interface PendingWrite {
+  readonly target: PlaybackTarget;
+  readonly controller: AbortController;
+  readonly callback: (status: number | null) => void;
+  settled: boolean;
+}
 /** One-shot presentation deadline only; never a backend retry or poll. */
 export interface PresentationTiming {
   readonly now?: () => number;
@@ -21,7 +29,11 @@ interface Entry {
   readonly uuid: string;
   accessory?: PlatformAccessory;
   current?: Characteristic;
+  target?: Characteristic;
+  playbackSwitch?: Characteristic;
+  pending?: PendingWrite;
   failed: boolean;
+  published?: boolean;
   outage?: Outage;
   timingFailed?: boolean;
   confirmed?: number;
@@ -37,13 +49,15 @@ export function productionAccessoryUuid(api: Pick<API, 'hap'>, account: string, 
   return api.hap.uuid.generate(JSON.stringify([PLUGIN_NAME, 'external-smartspeaker', 1, account, mac.toUpperCase()]));
 }
 
-/** Read-only HAP projection. No backend state ownership, commands or storage. Only a bounded last-confirmed presentation.
+/** Observed HAP projection with an explicit, default-disabled coordinator command adapter.
+ * No backend state ownership or storage. Only a bounded last-confirmed presentation.
  * One cancellable presentation grace deadline per accessory.
  * Homebridge owns pairing/server lifetime. A dispatched publication is never retried in-process:
  * its void API cannot distinguish failure before side effects from failure after publication. */
 export class ProductionAccessories implements ProductionPresentation {
   readonly #api: API;
   readonly #timing: PresentationTiming;
+  readonly #commands: boolean;
   readonly #warn: (message: string) => void;
   #reader?: ProductionReader;
   #entries = new Map<string, Entry>();
@@ -52,7 +66,9 @@ export class ProductionAccessories implements ProductionPresentation {
   #queued = false;
   #epoch: object = {};
 
-  constructor(api: API, reader: ProductionReader, warn: (message: string) => void, timing: PresentationTiming = {}) {
+  constructor(api: API, reader: ProductionReader, warn: (message: string) => void,
+    timing: PresentationTiming = {}, commands: PlaybackPresentationOptions = {}) {
+    this.#commands = commands.enablePlaybackCommands === true;
     this.#timing = timing; this.#api = api; this.#reader = reader; this.#warn = warn;
     // Singular platform: a second owner in the same Homebridge process must not republish externals.
     if (owners.has(api)) {
@@ -111,6 +127,143 @@ export class ProductionAccessories implements ProductionPresentation {
       return undefined;
     }
     return inventory.devices.find(d => productionAccessoryUuid(this.#api, inventory.accountUuid, d.macAddress) === entry.uuid);
+  }
+  #commandTarget(entry: Entry): PlaybackTarget | undefined {
+    if (this.#stopped || entry.failed || !entry.published) {
+      return undefined;
+    }
+    const inventory = this.#inventory();
+    if (inventory?.authority !== 'current') {
+      return undefined;
+    }
+    const route = inventory.devices.find(d => productionAccessoryUuid(this.#api, inventory.accountUuid, d.macAddress) === entry.uuid);
+    return route && { accountUuid: inventory.accountUuid, routeId: route.routeId, macAddress: route.macAddress };
+  }
+  #ownsWrite(entry: Entry, pending: PendingWrite): boolean {
+    const target = this.#commandTarget(entry);
+    return !this.#stopped && !entry.failed && entry.pending === pending && !!target
+      && target.accountUuid === pending.target.accountUuid && target.routeId === pending.target.routeId
+      && target.macAddress === pending.target.macAddress;
+  }
+  #finishWrite(entry: Entry, pending: PendingWrite, status: number | null): void {
+    if (entry.pending !== pending || pending.settled) {
+      return;
+    }
+    pending.settled = true;
+    try {
+      pending.controller.abort();
+    } catch { /* Local cancellation cannot retract a transmitted command. */ }
+    try {
+      if (!this.#ownsWrite(entry, pending)) {
+        status = this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE;
+      }
+    } catch {
+      status = this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE;
+    }
+    if (this.#stopped || entry.failed) {
+      status = this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE;
+    }
+    try {
+      pending.callback(status);
+    } catch { /* Host callback failures must not escape or cause another acknowledgement. */ } finally {
+      // HAP's callback synchronously caches the submitted value. Reconcile afterwards,
+      // retaining the busy guard through both the callback and characteristic notifications.
+      this.#sync(entry);
+      if (entry.pending === pending) {
+        entry.pending = undefined;
+      }
+    }
+  }
+  #cancelWrite(entry: Entry): void {
+    if (entry.pending) {
+      this.#finishWrite(entry, entry.pending, this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+  #write(entry: Entry, value: unknown, callback: (status: number | null) => void): void {
+    const { HAPStatus: H } = this.#api.hap;
+    const C = this.#api.hap.Characteristic.TargetMediaState;
+    if (!this.#commands) {
+      callback(H.NOT_ALLOWED_IN_CURRENT_STATE); return;
+    }
+    if (typeof value !== 'number' || !Number.isInteger(value) || ![C.PLAY, C.PAUSE, C.STOP].includes(value)) {
+      callback(H.INVALID_VALUE_IN_REQUEST); return;
+    }
+    if (value === C.STOP) {
+      callback(H.NOT_ALLOWED_IN_CURRENT_STATE); return;
+    }
+    if (entry.pending) {
+      callback(H.RESOURCE_BUSY); return;
+    }
+    // Reserve before invoking inventory getters or dependency callbacks.
+    const pending: PendingWrite = { target: { accountUuid: '', routeId: '', macAddress: '' },
+      controller: new AbortController(), callback, settled: false };
+    entry.pending = pending;
+    try {
+      const target = this.#commandTarget(entry);
+      const reader = this.#reader, request = reader?.requestPlayback;
+      if (!target || typeof request !== 'function' || this.#stopped || pending.settled) {
+        this.#finishWrite(entry, pending, H.SERVICE_COMMUNICATION_FAILURE); return;
+      }
+      Object.assign(pending.target, target);
+      if (!this.#ownsWrite(entry, pending) || pending.settled) {
+        this.#finishWrite(entry, pending, H.SERVICE_COMMUNICATION_FAILURE); return;
+      }
+      const result = request.call(reader, { ...target }, value === C.PLAY ? 'play' : 'pause', { signal: pending.controller.signal });
+      void Promise.resolve(result).then(outcome => {
+        let status: number | null = H.SERVICE_COMMUNICATION_FAILURE;
+        if (outcome?.ok === true && ['confirmed', 'already-satisfied'].includes(outcome.outcome)) {
+          status = null;
+        } else if (outcome?.ok === false && outcome.delivery === 'not-dispatched') {
+          if (outcome.reason === 'busy' || outcome.reason === 'capacity') {
+            status = H.RESOURCE_BUSY;
+          } else if (outcome.reason === 'insufficient-state') {
+            status = H.NOT_ALLOWED_IN_CURRENT_STATE;
+          } else if (outcome.reason === 'invalid-input') {
+            status = H.INVALID_VALUE_IN_REQUEST;
+          }
+        }
+        this.#finishWrite(entry, pending, status);
+      }).catch(() => this.#finishWrite(entry, pending, H.SERVICE_COMMUNICATION_FAILURE));
+    } catch {
+      this.#finishWrite(entry, pending, H.SERVICE_COMMUNICATION_FAILURE);
+    }
+  }
+  #targetMedia(entry: Entry): number {
+    const epoch = this.#epoch;
+    const target = this.#commandTarget(entry);
+    const observation = target && this.#reader?.getDevice(target.routeId, 'production');
+    const still = this.#commandTarget(entry);
+    if (epoch !== this.#epoch || !target || !still || target.accountUuid !== still.accountUuid || target.routeId !== still.routeId
+      || target.macAddress !== still.macAddress || this.#stopped || entry.failed
+      || observation?.state.identity.id !== target.routeId || observation.state.identity.macAddress !== target.macAddress
+      || observation.transport.status !== 'connected') {
+      throw this.#unavailable();
+    }
+    const online = observation.state.topics?.['online-state'];
+    if (online?.session !== observation.transport.session || online?.value.onlineState !== 'connected') {
+      throw this.#unavailable();
+    }
+    const C = this.#api.hap.Characteristic.TargetMediaState;
+    if (observation.playback === 'playing') {
+      return C.PLAY;
+    }
+    if (observation.playback === 'paused') {
+      return C.PAUSE;
+    }
+    if (observation.playback === 'empty') {
+      return C.STOP;
+    }
+    throw this.#unavailable();
+  }
+  #switchValue(entry: Entry): boolean {
+    const value = this.#targetMedia(entry), C = this.#api.hap.Characteristic.TargetMediaState;
+    if (value === C.PLAY) {
+      return true;
+    }
+    if (value === C.PAUSE) {
+      return false;
+    }
+    throw this.#unavailable();
   }
   #unavailable(): Error {
     return new this.#api.hap.HapStatusError(this.#api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
@@ -249,10 +402,50 @@ export class ProductionAccessories implements ProductionPresentation {
       callback(null, value);
     });
     current.updateValue(this.#unavailable());
-    const target = speaker.getCharacteristic(C.TargetMediaState);
-    target.on('get', callback => callback(HAPStatus.SERVICE_COMMUNICATION_FAILURE));
-    target.on('set', (_value, callback) => callback(HAPStatus.NOT_ALLOWED_IN_CURRENT_STATE));
+    const target = speaker.getCharacteristic(C.TargetMediaState); entry.target = target;
+    target.on('get', callback => {
+      let value: number;
+      try {
+        if (!this.#commands) {
+          throw this.#unavailable();
+        }
+        value = this.#targetMedia(entry);
+      } catch {
+        callback(HAPStatus.SERVICE_COMMUNICATION_FAILURE); return;
+      }
+      callback(null, value);
+    });
+    target.on('set', (value, callback) => this.#write(entry, value, status => {
+      try {
+        callback(status);
+      } catch { /* Host callbacks never escape the adapter, including immediate rejection. */ }
+    }));
     target.updateValue(this.#unavailable()); // No desired physical state is known or commanded.
+    if (this.#commands) {
+      const playback = accessory.addService(S.Switch, 'Playback', 'playback');
+      const on = playback.getCharacteristic(C.On); entry.playbackSwitch = on;
+      on.updateValue(this.#unavailable());
+      on.on('get', callback => {
+        let value: boolean;
+        try {
+          value = this.#switchValue(entry);
+        } catch {
+          callback(HAPStatus.SERVICE_COMMUNICATION_FAILURE); return;
+        }
+        callback(null, value);
+      });
+      on.on('set', (value, callback) => {
+        const done = (status: number | null): void => {
+          try {
+            callback(status);
+          } catch { /* Host callbacks cannot escape the shared command adapter. */ }
+        };
+        if (typeof value !== 'boolean') {
+          done(HAPStatus.INVALID_VALUE_IN_REQUEST); return;
+        }
+        this.#write(entry, value ? C.TargetMediaState.PLAY : C.TargetMediaState.PAUSE, done);
+      });
+    }
     const name = speaker.getCharacteristic(C.ConfiguredName);
     const initialRoute = this.#route(entry);
     name.updateValue(initialRoute?.displayName ?? this.#unavailable());
@@ -271,6 +464,9 @@ export class ProductionAccessories implements ProductionPresentation {
   }
   #sync(entry: Entry): void {
     try {
+      if (entry.pending && !entry.pending.settled && !this.#ownsWrite(entry, entry.pending)) {
+        this.#cancelWrite(entry);
+      }
       const route = this.#route(entry);
       if (route && entry.accessory) {
         const name = entry.accessory.getService(this.#api.hap.Service.SmartSpeaker)!
@@ -288,14 +484,39 @@ export class ProductionAccessories implements ProductionPresentation {
       if (entry.current && (value instanceof Error || entry.current.value !== value || entry.current.statusCode !== 0)) {
         entry.current.updateValue(value);
       }
+      if (this.#commands && entry.target) {
+        let target: number | Error;
+        try {
+          target = this.#targetMedia(entry);
+        } catch {
+          target = this.#unavailable();
+        }
+        if (target instanceof Error || entry.target.value !== target || entry.target.statusCode !== 0) {
+          entry.target.updateValue(target);
+        }
+      }
+      if (entry.playbackSwitch) {
+        let value: boolean | Error;
+        try {
+          value = this.#switchValue(entry);
+        } catch {
+          value = this.#unavailable();
+        }
+        if (value instanceof Error || entry.playbackSwitch.value !== value || entry.playbackSwitch.statusCode !== 0) {
+          entry.playbackSwitch.updateValue(value);
+        }
+      }
     } catch { /* Fault one accessory, never the backend or unrelated accessories. */
       this.#fault(entry);
     }
   }
   #fault(entry: Entry): void {
+    this.#cancelWrite(entry);
     this.#clearOutage(entry); entry.confirmed = undefined; entry.session = undefined;
     try {
       entry.current?.updateValue(this.#unavailable());
+      entry.target?.updateValue(this.#unavailable());
+      entry.playbackSwitch?.updateValue(this.#unavailable());
     } catch { /* A broken host characteristic cannot regain read authority. */ }
   }
   refresh(): void {
@@ -303,6 +524,17 @@ export class ProductionAccessories implements ProductionPresentation {
       return;
     }
     this.#epoch = {};
+    for (const entry of this.#entries.values()) {
+      if (entry.pending && !entry.pending.settled) {
+        try {
+          if (!this.#ownsWrite(entry, entry.pending)) {
+            this.#cancelWrite(entry);
+          }
+        } catch {
+          this.#cancelWrite(entry);
+        }
+      }
+    }
     if (this.#queued) {
       return;
     }
@@ -338,6 +570,7 @@ export class ProductionAccessories implements ProductionPresentation {
                 }
                 // Public API returns void, not confirmation. Never log or infer publication success.
                 const returned: unknown = this.#api.publishExternalAccessories(PLUGIN_NAME, [entry.accessory!]);
+                entry.published = true;
                 void Promise.resolve(returned).catch(() => {
                   entry.failed = true; this.#fault(entry); this.#notice('publication');
                 });

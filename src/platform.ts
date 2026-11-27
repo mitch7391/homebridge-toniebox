@@ -7,7 +7,8 @@ import type { PlatformRuntimeOptions } from './platformRuntime.js';
 export class TonieboxPlatform implements DynamicPlatformPlugin {
   constructor(log: Logging, config: PlatformConfig, api: API, options: PlatformRuntimeOptions = {}) {
     const runtime = new PlatformRuntime(config, log, { ...options,
-      presentationFactory: options.presentationFactory ?? (reader => new ProductionAccessories(api, reader, message => log.warn(message))),
+      presentationFactory: options.presentationFactory ?? ((reader, enablePlaybackCommands) =>
+        new ProductionAccessories(api, reader, message => log.warn(message), {}, { enablePlaybackCommands })),
     });
     api.on('didFinishLaunching', () => runtime.launch());
     api.on('shutdown', () => runtime.stop());

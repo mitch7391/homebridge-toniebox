@@ -6,8 +6,11 @@ import type { AuthCredentials } from './toniebox/authTypes.js';
 import type { AccountCoordinator, CoordinatorResult, CoordinatorStatus, ProductionChange } from './toniebox/accountCoordinatorTypes.js';
 
 export interface PlatformRuntimeOptions {
-  readonly coordinatorFactory?: (onStatus: (status: CoordinatorStatus) => void, onProductionChange: (notice: ProductionChange) => void) => AccountCoordinator;
-  readonly presentationFactory?: (reader: ProductionReader) => ProductionPresentation;
+  /** Trusted construction option only; never read from Homebridge user configuration. */
+  readonly enablePlaybackCommands?: boolean;
+  readonly coordinatorFactory?: (onStatus: (status: CoordinatorStatus) => void,
+    onProductionChange: (notice: ProductionChange) => void, enablePlaybackCommands: boolean) => AccountCoordinator;
+  readonly presentationFactory?: (reader: ProductionReader, enablePlaybackCommands: boolean) => ProductionPresentation;
   readonly now?: () => number;
   readonly schedule?: (callback: () => void, delayMs: number) => () => void;
   readonly jitter?: () => number;
@@ -185,7 +188,8 @@ export class PlatformRuntime {
       if (this.#stopped) {
         return;
       }
-      const coordinator = (this.#options.coordinatorFactory ?? ((onStatus, onProductionChange) => createAccountCoordinator({ onStatus, onProductionChange,
+      const coordinator = (this.#options.coordinatorFactory ?? ((onStatus, onProductionChange, enablePlaybackCommands) => createAccountCoordinator({
+        onStatus, onProductionChange, enablePlaybackCommands,
         ...(COMMISSIONING_BUILD ? { onCommissioning: event => {
           if (!this.#stopped) {
             try {
@@ -199,14 +203,14 @@ export class PlatformRuntime {
             void Promise.resolve(this.#presentation?.refresh()).catch(() => undefined);
           });
         }
-      });
+      }, this.#options.enablePlaybackCommands === true);
       if (this.#stopped) {
         quietly(() => coordinator.stop()); return;
       }
       this.#coordinator = coordinator;
       if (this.#options.presentationFactory) {
         try {
-          const presentation = this.#options.presentationFactory(coordinator);
+          const presentation = this.#options.presentationFactory(coordinator, this.#options.enablePlaybackCommands === true);
           if (this.#stopped) {
             quietly(() => {
               void Promise.resolve(presentation.stop()).catch(() => undefined);

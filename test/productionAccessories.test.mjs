@@ -97,7 +97,7 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     };
     f.manager = new ProductionAccessories(api, f.reader, message => {
       f.logs.push(message); return options.log?.();
-    }, f.timing);
+    }, f.timing, { enablePlaybackCommands: options.enablePlaybackCommands });
     managers.push(f.manager);
     f.refresh = async () => {
       f.manager.refresh(); await drain();
@@ -593,6 +593,364 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
   await t.test('cold disconnected startup never fabricates playback during grace', async () => {
     const f = setup(); f.observation = observation('unknown'); f.observation.transport.status = 'disconnected';
     await f.refresh(); await unknown(f.current()); await f.elapse(10000); await unknown(f.current());
+  });
+
+  const controls = async (request, extra = {}) => {
+    const f = setup({ enablePlaybackCommands: true, ...extra });
+    f.observation.state.topics = { 'online-state': { session: 1, value: { onlineState: 'connected' } } };
+    f.commands = [];
+    f.reader.requestPlayback = (target, action, options) => {
+      f.commands.push({ target, action, options }); return request?.(f, target, action, options);
+    };
+    await f.refresh();
+    f.target = () => f.accessory().getService(S.SmartSpeaker).getCharacteristic(C.TargetMediaState);
+    return f;
+  };
+  const defer = () => {
+    let resolve, reject;
+    const promise = new Promise((a, b) => {
+      resolve = a; reject = b;
+    });
+    return { promise, resolve, reject };
+  };
+  const rawWrite = (characteristic, value) => new Promise(resolve => characteristic.emit('set', value, resolve));
+
+  await t.test('command opt-in is strict and disabled presentation cannot invoke coordinator', async () => {
+    for (const enablePlaybackCommands of [undefined, false, 'true', 1]) {
+      const f = await controls(() => {
+        throw new Error('Must not invoke');
+      }, { enablePlaybackCommands });
+      await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.NOT_ALLOWED_IN_CURRENT_STATE);
+      assert.equal(f.commands.length, 0); await unavailable(f.target());
+    }
+  });
+  for (const [value, action] of [[C.TargetMediaState.PLAY, 'play'], [C.TargetMediaState.PAUSE, 'pause']]) {
+    await t.test('native ' + action + ' forwards current verified identity and waits for confirmation', async () => {
+      const pending = defer(), f = await controls(() => pending.promise);
+      const expectedUuid = f.accessory().UUID;
+      let settled = false;
+      const write = f.target().handleSetRequest(value).then(() => {
+        settled = true;
+      });
+      await drain(); assert.equal(settled, false); assert.equal(f.current().value, C.CurrentMediaState.PLAY);
+      assert.deepEqual(f.commands[0].target, { accountUuid: account, routeId: 'SYNTHETIC_ROUTE', macAddress: mac });
+      assert.equal(f.commands[0].action, action); assert.ok(f.commands[0].options.signal instanceof globalThis.AbortSignal);
+      f.observation.playback = action === 'play' ? 'playing' : 'paused'; await f.refresh();
+      assert.equal(settled, false); // An observation alone is not coordinator completion.
+      pending.resolve({ ok: true, outcome: 'confirmed' }); await write;
+      assert.equal(f.target().value, value); assert.equal(f.current().value, value);
+      assert.equal(await f.target().handleGetRequest(), value); assert.equal(f.accessory().UUID, expectedUuid);
+      assert.deepEqual(f.accessory().services.map(x => x.UUID).sort(), [S.AccessoryInformation.UUID, S.SmartSpeaker.UUID, S.Switch.UUID].sort());
+      assert.equal(f.jobs.size, 0);
+    });
+  }
+  await t.test('already-satisfied coordinator completion succeeds without inventing physical changes', async () => {
+    const f = await controls(() => ({ ok: true, outcome: 'already-satisfied' }));
+    await f.target().handleSetRequest(C.TargetMediaState.PLAY);
+    assert.equal(f.current().value, C.CurrentMediaState.PLAY); assert.equal(f.commands.length, 1);
+  });
+  await t.test('STOP and malformed values reject without coordinator calls', async () => {
+    const f = await controls();
+    assert.equal(await rawWrite(f.target(), C.TargetMediaState.STOP), H.NOT_ALLOWED_IN_CURRENT_STATE);
+    for (const value of [null, undefined, '0', true, -1, 3, NaN, Infinity, 0.5, {}]) {
+      assert.equal(await rawWrite(f.target(), value), H.INVALID_VALUE_IN_REQUEST);
+    }
+    assert.equal(f.commands.length, 0);
+  });
+  await t.test('pending and callback-reentrant writes are busy; latest observation wins HAP cache', async () => {
+    const pending = defer(), f = await controls(() => pending.promise);
+    const first = f.target().handleSetRequest(C.TargetMediaState.PAUSE);
+    await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PLAY), e => e === H.RESOURCE_BUSY);
+    let nested;
+    f.target().on('change', event => {
+      if (event.reason === 'write') {
+        nested = rawWrite(f.target(), C.TargetMediaState.PLAY);
+      }
+    });
+    // Confirmation can be followed by an independent physical change before HAP acknowledges.
+    f.observation.playback = 'playing'; pending.resolve({ ok: true, outcome: 'confirmed' }); await first;
+    assert.equal(await nested, H.RESOURCE_BUSY); assert.equal(f.commands.length, 1);
+    assert.equal(f.target().value, C.TargetMediaState.PLAY); assert.equal(f.current().value, C.CurrentMediaState.PLAY);
+  });
+  for (const [reason, delivery, expected] of [
+    ['timeout', 'uncertain', H.SERVICE_COMMUNICATION_FAILURE], ['interrupted', 'uncertain', H.SERVICE_COMMUNICATION_FAILURE],
+    ['busy', 'not-dispatched', H.RESOURCE_BUSY], ['capacity', 'not-dispatched', H.RESOURCE_BUSY],
+    ['insufficient-state', 'not-dispatched', H.NOT_ALLOWED_IN_CURRENT_STATE],
+    ['invalid-input', 'not-dispatched', H.INVALID_VALUE_IN_REQUEST], ['not-authorised', 'not-dispatched', H.SERVICE_COMMUNICATION_FAILURE],
+    ['busy', 'uncertain', H.SERVICE_COMMUNICATION_FAILURE],
+  ]) {
+    await t.test('sanitised native failure: ' + reason + '/' + delivery, async () => {
+      const f = await controls(() => ({ ok: false, reason, delivery }));
+      await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PAUSE), e => e === expected);
+      assert.equal(f.current().value, C.CurrentMediaState.PLAY); assert.equal(f.commands.length, 1);
+      assert.deepEqual(f.logs, []);
+    });
+  }
+  for (const mode of ['throw', 'reject', 'malformed', 'puback']) {
+    await t.test('dependency failure never reports success: ' + mode, async () => {
+      const f = await controls(() => {
+        if (mode === 'throw') {
+          throw new Error('PRIVATE');
+        }
+        if (mode === 'reject') {
+          return Promise.reject(new Error('PRIVATE'));
+        }
+        return mode === 'puback' ? { ok: true, acknowledgement: 'broker' } : null;
+      });
+      await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+      assert.deepEqual(f.logs, []); assert.equal(f.commands.length, 1);
+    });
+  }
+  for (const mode of ['shutdown', 'revocation', 'account', 'route', 'last-known']) {
+    await t.test('pending write cancelled once on ' + mode + '; late success is inert', async () => {
+      const pending = defer(), f = await controls(() => pending.promise); let count = 0, status;
+      f.target().emit('set', C.TargetMediaState.PAUSE, error => {
+        count++; status = error;
+      });
+      if (mode === 'shutdown') {
+        f.manager.stop();
+      } else {
+        f.inventory = mode === 'revocation' ? { authority: 'none', devices: [] }
+          : mode === 'account' ? inventory([device()], 'OTHER_ACCOUNT')
+            : mode === 'route' ? inventory([device('OTHER_ROUTE')]) : inventory([device()], account, 'last-known');
+        f.manager.refresh();
+      }
+      await drain(); assert.equal(count, 1); assert.equal(status, H.SERVICE_COMMUNICATION_FAILURE);
+      assert.equal(f.commands[0].options.signal.aborted, true);
+      pending.resolve({ ok: true, outcome: 'confirmed' }); await drain(); assert.equal(count, 1);
+      await unavailable(f.target()); assert.equal(f.jobs.size, 0);
+    });
+  }
+  await t.test('throwing callback completes once and releases the busy guard', async () => {
+    const f = await controls(() => ({ ok: true, outcome: 'confirmed' })); let count = 0;
+    f.target().emit('set', C.TargetMediaState.PAUSE, () => {
+      count++; throw new Error('PRIVATE');
+    });
+    await drain(); assert.equal(count, 1);
+    await f.target().handleSetRequest(C.TargetMediaState.PLAY); assert.equal(f.commands.length, 2);
+  });
+  await t.test('transport display grace is not used as command authority or target read evidence', async () => {
+    const f = await controls(() => ({ ok: false, reason: 'not-ready', delivery: 'not-dispatched' }));
+    f.observation.transport.status = 'disconnected'; f.observation.playback = 'unknown'; await f.refresh();
+    assert.equal(f.current().value, C.CurrentMediaState.PLAY); await unavailable(f.target());
+    await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+    assert.equal(f.commands.length, 1); // Coordinator, never the grace display, decides admission.
+    f.manager.stop(); assert.equal(f.jobs.size, 0);
+  });
+
+  await t.test('abort cleanup revocation cannot turn a completed result into obsolete HAP success', async () => {
+    const f = await controls((_f, _target, _action, options) => {
+      options.signal.addEventListener('abort', () => {
+        f.inventory = { authority: 'none', devices: [] };
+      });
+      return { ok: true, outcome: 'confirmed' };
+    });
+    await assert.rejects(f.target().handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+    await unavailable(f.target());
+  });
+  await t.test('publication reentrancy cannot dispatch before the accessory is published', async () => {
+    let rejected;
+    const f = await controls(() => ({ ok: true, outcome: 'confirmed' }), { publish(host) {
+      rejected = rawWrite(host.accessory().getService(S.SmartSpeaker).getCharacteristic(C.TargetMediaState), C.TargetMediaState.PLAY);
+    } });
+    assert.equal(await rejected, H.SERVICE_COMMUNICATION_FAILURE); assert.equal(f.commands.length, 0);
+  });
+  for (const enabled of [false, true]) {
+    await t.test('platform native writes compose with real coordinator, enabled=' + enabled, async () => {
+      const f = setup(); f.manager.stop(); const jobs = new Set(), calls = [];
+      let coordinator, lane, status = { phase: 'idle', connected: false }, now = 0;
+      const ok = value => ({ ok: true, value, diagnostics: {
+        rejectedEntries: 0, degradedEntries: 0, duplicateEntries: 0, ambiguousRoutingEntries: 0, continuationDetected: false,
+      } });
+      const host = new EventEmitter(); Object.assign(host, { hap, platformAccessory: PlatformAccessory,
+        publishExternalAccessories: f.api.publishExternalAccessories });
+      const platform = new TonieboxPlatform({ info(message) {
+        f.logs.push(message);
+      }, warn(message) {
+        f.logs.push(message);
+      } },
+      { username: 'SYNTHETIC', password: 'SECRET', enablePlaybackCommands: true }, host, {
+        enablePlaybackCommands: enabled,
+        coordinatorFactory: (onStatus, onProductionChange, permission) => {
+          assert.equal(permission, enabled);
+          coordinator = createAccountCoordinator({ enablePlaybackCommands: permission, onStatus, onProductionChange,
+            clock: { now: () => ({ monotonicMs: now, wallMs: now }) }, scheduler: { schedule(fn, ms) {
+              const job = { fn, ms }; jobs.add(job); return () => jobs.delete(job);
+            } },
+            authClient: { login: async () => ({ ok: true, tokens: {
+              accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH', expiresInSeconds: 300, tokenType: 'Bearer',
+            } }), refresh: deny },
+            discoveryClient: { getAccount: async () => ok({ id: account, identitySource: 'uuid' }),
+              getHouseholds: async () => ok([{ id: 'SYNTHETIC_HOUSE' }]), getTonieboxes: async () => ok([
+                { id: 'SYNTHETIC_ROUTE', macAddress: mac, product: 'tb2', generation: 'tng', features: ['playbackControls'] },
+              ]) },
+            lifecycleFactory: options => {
+              lane = options; return { start() {
+                status = { phase: 'ready', connected: true, session: 1 }; options.onStatus(status);
+              }, stop() {}, getStatus: () => status,
+              publishPlayback(routeId, action, opts) {
+                calls.push({ routeId, action, opts }); return Promise.resolve({ ok: true, acknowledgement: 'broker' });
+              } };
+            },
+          }); return coordinator;
+        },
+      });
+      const message = (topic, payload, retained = false) => lane.onMessage({ routeId: 'SYNTHETIC_ROUTE',
+        topic: 'external/toniebox/' + mac + '/' + topic, payload: new TextEncoder().encode(JSON.stringify(payload)),
+        session: 1, retained, duplicate: false, qos: 1, receivedAtMs: ++now });
+      try {
+        platform.configureAccessory(); host.emit('didFinishLaunching'); await drain(); await coordinator.discover(); await drain();
+        message('online-state', { onlineState: 'connected' });
+        message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await drain();
+        assert.equal(f.published.length, 1, JSON.stringify({ logs: f.logs, status: coordinator.getStatus(), inventory: coordinator.getProductionInventory() }));
+        const target = f.accessory().getService(S.SmartSpeaker).getCharacteristic(C.TargetMediaState);
+        if (!enabled) {
+          await assert.rejects(target.handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.NOT_ALLOWED_IN_CURRENT_STATE);
+          assert.equal(calls.length, 0); assert.deepEqual(lane.playbackRouteIds ?? [], []);
+        } else {
+          await target.handleSetRequest(C.TargetMediaState.PLAY); assert.equal(calls.length, 0); // Real no-op admission.
+          let settled = false;
+          const pause = f.accessory().getService(S.Switch).getCharacteristic(C.On).handleSetRequest(false).then(() => {
+            settled = true;
+          });
+          await drain(); assert.equal(calls.length, 1); assert.equal(settled, false); // PUBACK alone is insufficient.
+          assert.equal(f.current().value, C.CurrentMediaState.PLAY);
+          message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: true }); await pause; await drain();
+          assert.equal(f.current().value, C.CurrentMediaState.PAUSE); assert.equal(target.value, C.TargetMediaState.PAUSE);
+          const timed = assert.rejects(target.handleSetRequest(C.TargetMediaState.PLAY), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+          await drain(); now += 5000;
+          for (const job of [...jobs]) {
+            if (job.ms <= 5000) {
+              job.fn();
+            }
+          }
+          await timed; assert.equal(calls.length, 2);
+          const interrupted = assert.rejects(f.accessory().getService(S.Switch).getCharacteristic(C.On).handleSetRequest(true),
+            e => e === H.SERVICE_COMMUNICATION_FAILURE);
+          await drain(); coordinator.setCredentials({ username: 'SYNTHETIC_REPLACEMENT', password: 'OTHER_SECRET' });
+          await interrupted; assert.equal(calls.length, 3);
+          await assert.rejects(target.handleSetRequest(C.TargetMediaState.PLAY), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+          assert.equal(calls.length, 3); // No replay across credential replacement.
+        }
+      } finally {
+        host.emit('shutdown'); coordinator?.stop();
+      }
+      assert.equal(jobs.size, 0);
+    });
+  }
+
+  await t.test('reentrant request getter revokes dispatch and immediate callback errors are contained', async () => {
+    const f = await controls(); let dispatched = 0, count = 0;
+    Object.defineProperty(f.reader, 'requestPlayback', { get() {
+      f.manager.stop(); return () => {
+        dispatched++; return { ok: true, outcome: 'confirmed' };
+      };
+    } });
+    assert.doesNotThrow(() => f.target().emit('set', C.TargetMediaState.PLAY, status => {
+      count++; assert.equal(status, H.SERVICE_COMMUNICATION_FAILURE); throw new Error('PRIVATE');
+    }));
+    await drain(); assert.equal(count, 1); assert.equal(dispatched, 0);
+    assert.doesNotThrow(() => f.target().emit('set', C.TargetMediaState.STOP, () => {
+      throw new Error('PRIVATE');
+    }));
+  });
+
+  const switchOn = f => f.accessory().getService(S.Switch).getCharacteristic(C.On);
+  await t.test('Playback Switch identity is stable and disabled composition remains unchanged', async () => {
+    const f = await controls(), uuid = f.accessory().UUID, service = f.accessory().getService(S.Switch);
+    assert.equal(service.displayName, 'Playback'); assert.equal(service.subtype, 'playback');
+    for (let i = 0; i < 5; i++) {
+      await f.refresh();
+    }
+    assert.equal(f.published.length, 1); assert.equal(f.accessory().UUID, uuid);
+    assert.equal(f.accessory().getService(S.Switch), service); assert.equal(f.accessory().getService(S.SmartSpeaker).isPrimaryService, true);
+    const disabled = setup(); await disabled.refresh(); assert.equal(disabled.accessory().getService(S.Switch), undefined);
+  });
+  for (const state of ['playing', 'paused', 'empty', 'unknown', 'inactive']) {
+    await t.test('Switch authoritative read: ' + state, async () => {
+      const f = await controls(); f.observation.playback = state; await f.refresh();
+      if (state === 'playing' || state === 'paused') {
+        assert.equal(await switchOn(f).handleGetRequest(), state === 'playing');
+      } else {
+        await unavailable(switchOn(f));
+      }
+      assert.equal(f.commands.length, 0);
+    });
+  }
+  for (const viaSwitch of [true, false]) {
+    await t.test('shared pending ownership and callback reconciliation, switch first=' + viaSwitch, async () => {
+      const pending = defer(), f = await controls(() => pending.promise), on = switchOn(f);
+      const first = viaSwitch ? on : f.target(), other = viaSwitch ? f.target() : on;
+      const write = first.handleSetRequest(viaSwitch ? false : C.TargetMediaState.PAUSE);
+      await assert.rejects(other.handleSetRequest(viaSwitch ? C.TargetMediaState.PLAY : true), e => e === H.RESOURCE_BUSY);
+      assert.equal(on.value, true); assert.equal(f.commands.length, 1); assert.equal(f.commands[0].action, 'pause');
+      let nested;
+      first.on('change', event => {
+        if (event.reason === 'write') {
+          nested = rawWrite(other, viaSwitch ? C.TargetMediaState.PLAY : true);
+        }
+      });
+      f.observation.playback = 'paused'; await f.refresh(); assert.equal(on.value, false);
+      f.observation.playback = 'playing'; pending.resolve({ ok: true, outcome: 'confirmed' }); await write;
+      assert.equal(await nested, H.RESOURCE_BUSY); assert.equal(on.value, true); assert.equal(f.target().value, C.TargetMediaState.PLAY);
+    });
+  }
+  for (const mode of ['shutdown', 'revoked', 'account', 'last-known', 'offline']) {
+    await t.test('Switch authority failure: ' + mode, async () => {
+      const pending = defer(), f = await controls(() => pending.promise), on = switchOn(f);
+      const failure = assert.rejects(on.handleSetRequest(false), e => e === H.SERVICE_COMMUNICATION_FAILURE);
+      if (mode === 'shutdown') {
+        f.manager.stop();
+      } else if (mode === 'offline') {
+        f.observation.transport.status = 'disconnected'; pending.resolve({ ok: false, reason: 'interrupted', delivery: 'uncertain' });
+      } else {
+        f.inventory = mode === 'revoked' ? { authority: 'none', devices: [] } : inventory([device()], mode === 'account' ? 'OTHER' : account,
+          mode === 'last-known' ? 'last-known' : 'current');
+      }
+      await f.refresh(); await failure; pending.resolve({ ok: true, outcome: 'confirmed' }); await drain();
+      await unavailable(on); assert.equal(f.commands.length, 1); f.manager.stop(); assert.equal(f.jobs.size, 0);
+    });
+  }
+  await t.test('Switch rejects malformed inputs and maps true to play with exact identity', async () => {
+    const f = await controls(() => ({ ok: true, outcome: 'already-satisfied' }));
+    for (const value of [0, 1, 'true', null, undefined, {}]) {
+      assert.equal(await rawWrite(switchOn(f), value), H.INVALID_VALUE_IN_REQUEST);
+    }
+    assert.equal(f.commands.length, 0); await switchOn(f).handleSetRequest(true);
+    assert.equal(f.commands[0].action, 'play'); assert.deepEqual(f.commands[0].target, { accountUuid: account, routeId: 'SYNTHETIC_ROUTE', macAddress: mac });
+  });
+
+  for (const [reason, delivery, expected] of [
+    ['busy', 'not-dispatched', H.RESOURCE_BUSY], ['not-ready', 'not-dispatched', H.SERVICE_COMMUNICATION_FAILURE],
+    ['insufficient-state', 'not-dispatched', H.NOT_ALLOWED_IN_CURRENT_STATE], ['timeout', 'uncertain', H.SERVICE_COMMUNICATION_FAILURE],
+  ]) {
+    await t.test('Switch failure reconciliation: ' + reason, async () => {
+      const f = await controls(() => ({ ok: false, reason, delivery }));
+      await assert.rejects(switchOn(f).handleSetRequest(false), e => e === expected);
+      assert.equal(switchOn(f).value, true); assert.equal(f.current().value, C.CurrentMediaState.PLAY);
+      assert.equal(f.commands.length, 1);
+    });
+  }
+  await t.test('independent devices have separate pending guards and publication failure cancels once', async () => {
+    const pending = defer(), publication = defer();
+    const f = await controls(() => pending.promise, { publish: () => publication.promise });
+    const second = device('SECOND', 'SECOND_MAC'); f.inventory = inventory([device(), second]);
+    f.reader.getDevice = id => {
+      const result = observation('playing', id === 'SECOND' ? second : device());
+      result.state.topics = { 'online-state': { session: 1, value: { onlineState: 'connected' } } }; return result;
+    };
+    await f.refresh(); const other = f.accessory(1).getService(S.Switch).getCharacteristic(C.On);
+    let firstCount = 0, secondCount = 0;
+    switchOn(f).emit('set', false, status => {
+      firstCount++; assert.equal(status, H.SERVICE_COMMUNICATION_FAILURE);
+    });
+    other.emit('set', false, status => {
+      secondCount++; assert.equal(status, H.SERVICE_COMMUNICATION_FAILURE);
+    });
+    assert.equal(f.commands.length, 2);
+    publication.reject(new Error('PRIVATE')); await drain(); assert.equal(firstCount, 1); assert.equal(secondCount, 1);
+    pending.resolve({ ok: true, outcome: 'confirmed' }); await drain();
+    assert.equal(firstCount, 1); assert.equal(secondCount, 1); await unavailable(switchOn(f)); await unavailable(other);
   });
 
 });
