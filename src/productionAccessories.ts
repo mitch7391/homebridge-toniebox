@@ -31,6 +31,7 @@ interface Entry {
   current?: Characteristic;
   target?: Characteristic;
   playbackSwitch?: Characteristic;
+  switchRecoveryPending?: boolean; // Notification history only; GET/SET can independently clear HAP status.
   pending?: PendingWrite;
   failed: boolean;
   published?: boolean;
@@ -260,7 +261,9 @@ export class ProductionAccessories implements ProductionPresentation {
     if (value === C.PLAY) {
       return true;
     }
-    if (value === C.PAUSE) {
+    // Off means confirmed playback is not active, including empty (STOP), never unknown.
+    // Read feedback does not grant permission: writes still use coordinator admission.
+    if (value === C.PAUSE || value === C.STOP) {
       return false;
     }
     throw this.#unavailable();
@@ -424,12 +427,14 @@ export class ProductionAccessories implements ProductionPresentation {
     if (this.#commands) {
       const playback = accessory.addService(S.Switch, 'Playback', 'playback');
       const on = playback.getCharacteristic(C.On); entry.playbackSwitch = on;
+      entry.switchRecoveryPending = true;
       on.updateValue(this.#unavailable());
       on.on('get', callback => {
         let value: boolean;
         try {
           value = this.#switchValue(entry);
         } catch {
+          entry.switchRecoveryPending = true;
           callback(HAPStatus.SERVICE_COMMUNICATION_FAILURE); return;
         }
         callback(null, value);
@@ -502,7 +507,16 @@ export class ProductionAccessories implements ProductionPresentation {
         } catch {
           value = this.#unavailable();
         }
-        if (value instanceof Error || entry.playbackSwitch.value !== value || entry.playbackSwitch.statusCode !== 0) {
+        if (value instanceof Error) {
+          entry.switchRecoveryPending = true;
+          entry.playbackSwitch.updateValue(value); // HAP errors are available to reads, not event notifications.
+        } else if (entry.switchRecoveryPending) {
+          // HAP retains the Boolean during errors and filters ordinary same-value recovery.
+          // A GET may already have cleared statusCode. Consume before synchronous event reentrancy;
+          // a nested fault can then mark recovery pending again without being overwritten here.
+          entry.switchRecoveryPending = false;
+          entry.playbackSwitch.sendEventNotification(value);
+        } else if (entry.playbackSwitch.value !== value || entry.playbackSwitch.statusCode !== 0) {
           entry.playbackSwitch.updateValue(value);
         }
       }
@@ -513,6 +527,7 @@ export class ProductionAccessories implements ProductionPresentation {
   #fault(entry: Entry): void {
     this.#cancelWrite(entry);
     this.#clearOutage(entry); entry.confirmed = undefined; entry.session = undefined;
+    entry.switchRecoveryPending = true;
     try {
       entry.current?.updateValue(this.#unavailable());
       entry.target?.updateValue(this.#unavailable());

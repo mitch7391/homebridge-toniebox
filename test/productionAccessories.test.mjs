@@ -797,7 +797,7 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
       });
       const message = (topic, payload, retained = false) => lane.onMessage({ routeId: 'SYNTHETIC_ROUTE',
         topic: 'external/toniebox/' + mac + '/' + topic, payload: new TextEncoder().encode(JSON.stringify(payload)),
-        session: 1, retained, duplicate: false, qos: 1, receivedAtMs: ++now });
+        session: status.session, retained, duplicate: false, qos: 1, receivedAtMs: ++now });
       try {
         platform.configureAccessory(); host.emit('didFinishLaunching'); await drain(); await coordinator.discover(); await drain();
         message('online-state', { onlineState: 'connected' });
@@ -808,6 +808,26 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
           await assert.rejects(target.handleSetRequest(C.TargetMediaState.PAUSE), e => e === H.NOT_ALLOWED_IN_CURRENT_STATE);
           assert.equal(calls.length, 0); assert.deepEqual(lane.playbackRouteIds ?? [], []);
         } else {
+          const on = f.accessory().getService(S.Switch).getCharacteristic(C.On);
+          message('playback/state', { tonie: null }); await drain();
+          assert.equal(coordinator.getDevice('SYNTHETIC_ROUTE').playback, 'empty');
+          assert.equal(await on.handleGetRequest(), false);
+          for (const [characteristic, value] of [[on, true], [on, false], [target, C.TargetMediaState.PLAY], [target, C.TargetMediaState.PAUSE]]) {
+            await assert.rejects(characteristic.handleSetRequest(value), e => e === H.NOT_ALLOWED_IN_CURRENT_STATE);
+            assert.equal(calls.length, 0); assert.equal(on.value, false); assert.equal(on.statusCode, H.SUCCESS);
+            assert.equal(target.value, C.TargetMediaState.STOP); assert.equal(f.current().value, C.CurrentMediaState.STOP);
+          }
+          // These flags remain inactive, not empty/Off. The real backend supplies the interpretation.
+          for (const flag of ['blocked', 'downloading', 'ended']) {
+            message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false, [flag]: true }); await drain();
+            assert.equal(coordinator.getDevice('SYNTHETIC_ROUTE').playback, 'inactive'); await unavailable(on);
+          }
+          message('playback/state', { tonie: null }); await drain();
+          status = { phase: 'ready', connected: true, session: 2 }; lane.onStatus(status);
+          message('online-state', { onlineState: 'connected' });
+          assert.equal(coordinator.getDevice('SYNTHETIC_ROUTE').playback, 'unknown');
+          const staleRead = unavailable(on); // GET runs synchronously, before the new-session playback below.
+          message('playback/state', { tonie: 'SYNTHETIC_CONTENT', paused: false }); await staleRead; await drain();
           await target.handleSetRequest(C.TargetMediaState.PLAY); assert.equal(calls.length, 0); // Real no-op admission.
           let settled = false;
           const pause = f.accessory().getService(S.Switch).getCharacteristic(C.On).handleSetRequest(false).then(() => {
@@ -869,7 +889,7 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
   for (const state of ['playing', 'paused', 'empty', 'unknown', 'inactive']) {
     await t.test('Switch authoritative read: ' + state, async () => {
       const f = await controls(); f.observation.playback = state; await f.refresh();
-      if (state === 'playing' || state === 'paused') {
+      if (['playing', 'paused', 'empty'].includes(state)) {
         assert.equal(await switchOn(f).handleGetRequest(), state === 'playing');
       } else {
         await unavailable(switchOn(f));
@@ -951,6 +971,231 @@ test('production external SmartSpeaker (real installed HAP, synthetic offline ho
     publication.reject(new Error('PRIVATE')); await drain(); assert.equal(firstCount, 1); assert.equal(secondCount, 1);
     pending.resolve({ ok: true, outcome: 'confirmed' }); await drain();
     assert.equal(firstCount, 1); assert.equal(secondCount, 1); await unavailable(switchOn(f)); await unavailable(other);
+  });
+
+  // Actual Characteristic -> Service -> Accessory filtering, with only the server dispatch
+  // sink substituted. No socket, subscription delivery or Apple Home rendering is simulated.
+  const notificationSink = accessory => {
+    const on = accessory.getService(S.Switch).getCharacteristic(C.On), events = [], changes = [];
+    const real = accessory._associatedHAPAccessory; real.aid = 1; on.iid = 100;
+    real._server = { sendEventNotifications(aid, iid, value, originator, immediateDelivery) {
+      assert.equal(aid, 1); assert.equal(iid, 100); assert.ok(value === 0 || value === 1); // HAP formats BOOL as an integer for dispatch.
+      events.push({ value, originator, immediateDelivery });
+    } };
+    on.on('change', event => changes.push(event));
+    return { events, changes, values: () => events.map(e => e.value === 1), clear() {
+      events.length = 0; changes.length = 0;
+    } };
+  };
+  for (const value of [true, false]) {
+    await t.test('real HAP filters ordinary same-Boolean recovery but dispatches explicit recovery: ' + value, async () => {
+      const f = await controls(), on = switchOn(f); on.updateValue(value);
+      const sink = notificationSink(f.accessory());
+      on.updateValue(new hap.HapStatusError(H.SERVICE_COMMUNICATION_FAILURE));
+      assert.equal(on.value, value); assert.equal(on.statusCode, H.SERVICE_COMMUNICATION_FAILURE);
+      assert.equal(sink.changes.length, 0); assert.deepEqual(sink.values(), []);
+      on.updateValue(value); assert.equal(on.statusCode, H.SUCCESS);
+      assert.equal(sink.changes.length, 1); assert.equal(sink.changes[0].reason, 'update'); assert.deepEqual(sink.values(), []);
+      on.sendEventNotification(value);
+      assert.deepEqual(sink.values(), [value]); assert.equal(sink.changes[1].reason, 'event');
+    });
+  }
+  await t.test('Playing, Paused and empty use ordinary Boolean notifications and preserve SmartSpeaker STOP', async () => {
+    const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+    for (const [state, value, media] of [
+      ['empty', false, C.CurrentMediaState.STOP], ['playing', true, C.CurrentMediaState.PLAY],
+      ['paused', false, C.CurrentMediaState.PAUSE], ['empty', false, C.CurrentMediaState.STOP],
+      ['paused', false, C.CurrentMediaState.PAUSE], ['playing', true, C.CurrentMediaState.PLAY],
+    ]) {
+      f.observation.playback = state; await f.refresh();
+      assert.equal(on.value, value); assert.equal(on.statusCode, H.SUCCESS);
+      assert.equal(f.current().value, media); assert.equal(f.target().value, media);
+    }
+    assert.deepEqual(sink.values(), [false, true, false, true]);
+    assert.ok(sink.changes.every(e => e.reason === 'update'));
+    await f.refresh(); assert.equal(sink.events.length, 4); assert.equal(f.commands.length, 0);
+  });
+  for (const start of ['playing', 'paused']) {
+    for (const end of ['playing', 'paused', 'empty']) {
+      for (const getFirst of [false, true]) {
+        await t.test('Switch recovery ' + start + ' -> unavailable -> ' + end + ', GET first=' + getFirst, async () => {
+          const f = await controls(), on = switchOn(f);
+          f.observation.playback = start; await f.refresh(); const sink = notificationSink(f.accessory());
+          f.observation.playback = 'unknown'; await f.refresh(); await f.refresh();
+          assert.equal(on.value, start === 'playing'); assert.equal(on.statusCode, H.SERVICE_COMMUNICATION_FAILURE);
+          assert.deepEqual(sink.values(), []); assert.equal(sink.changes.length, 0);
+          f.observation.playback = end;
+          if (getFirst) {
+            assert.equal(await on.handleGetRequest(), end === 'playing'); assert.equal(on.statusCode, H.SUCCESS);
+            // A different-value GET can notify other clients, but the reader is excluded.
+            // Recovery still needs one explicit broadcast, including the original reader.
+            sink.clear();
+          }
+          await f.refresh();
+          assert.deepEqual(sink.values(), [end === 'playing']); assert.equal(on.statusCode, H.SUCCESS);
+          assert.equal(sink.changes.length, 1); assert.equal(sink.changes[0].reason, 'event');
+          assert.equal(sink.events[0].originator, undefined);
+          for (let i = 0; i < 3; i++) {
+            await on.handleGetRequest(); await f.refresh();
+          }
+          assert.equal(sink.events.length, 1); assert.equal(sink.changes.length, 1); assert.equal(f.commands.length, 0);
+        });
+      }
+    }
+  }
+  await t.test('GET-only unavailability is remembered even when a later GET clears HAP status before refresh', async () => {
+    const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+    f.observation.playback = 'unknown'; await unavailable(on); // No presentation refresh yet.
+    f.observation.playback = 'playing'; assert.equal(await on.handleGetRequest(), true);
+    assert.equal(on.statusCode, H.SUCCESS); assert.deepEqual(sink.values(), []);
+    await f.refresh(); assert.deepEqual(sink.values(), [true]); await f.refresh(); assert.equal(sink.events.length, 1);
+  });
+  for (const state of ['playing', 'paused', 'empty']) {
+    await t.test('initial publication and later usable acquisition notify once: ' + state, async () => {
+      let sink;
+      const f = await controls(undefined, { read(host) {
+        return { ...host.observation, playback: state };
+      }, publish(host) {
+        sink = notificationSink(host.accessory());
+      } });
+      assert.deepEqual(sink.values(), [state === 'playing']); await f.refresh(); assert.equal(sink.events.length, 1);
+      let other;
+      const g = await controls(undefined, { publish(host) {
+        host.observation.playback = 'unknown'; other = notificationSink(host.accessory());
+      } });
+      assert.deepEqual(other.values(), []); assert.equal(switchOn(g).statusCode, H.SERVICE_COMMUNICATION_FAILURE);
+      g.observation.playback = state; await g.refresh(); assert.deepEqual(other.values(), [state === 'playing']);
+    });
+  }
+  for (const mode of ['unknown', 'inactive', 'offline', 'disconnected', 'session', 'revoked', 'missing', 'last-known', 'identity']) {
+    await t.test('unusable authority never becomes Off or a recovery event: ' + mode, async () => {
+      const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+      f.observation.playback = 'empty';
+      if (['unknown', 'inactive'].includes(mode)) {
+        f.observation.playback = mode;
+      } else if (mode === 'offline') {
+        f.observation.state.topics['online-state'].value.onlineState = 'offline';
+      } else if (mode === 'disconnected') {
+        f.observation.transport.status = 'disconnected';
+      } else if (mode === 'session') {
+        f.observation.transport.session = 2;
+      } else if (mode === 'revoked') {
+        f.inventory = { authority: 'none', devices: [] };
+      } else if (mode === 'missing') {
+        f.inventory = inventory([]);
+      } else if (mode === 'last-known') {
+        f.inventory = inventory([device()], account, 'last-known');
+      } else {
+        f.observation.state.identity.macAddress = 'OTHER';
+      }
+      await f.refresh(); await unavailable(on); await f.refresh();
+      assert.equal(on.value, true); assert.deepEqual(sink.values(), []); assert.equal(f.commands.length, 0);
+      f.manager.stop(); assert.equal(f.jobs.size, 0);
+    });
+  }
+  for (const mode of ['shutdown', 'revoked', 'account', 'publication']) {
+    await t.test('obsolete ownership cannot emit queued recovery: ' + mode, async () => {
+      const publication = defer(), f = await controls(undefined, { publish: () => publication.promise });
+      const on = switchOn(f), sink = notificationSink(f.accessory());
+      f.observation.playback = 'unknown'; await f.refresh();
+      if (mode === 'publication') {
+        publication.reject(new Error('PRIVATE')); await drain();
+      }
+      f.observation.playback = 'playing'; f.manager.refresh();
+      if (mode === 'shutdown') {
+        f.manager.stop();
+      } else if (mode === 'revoked') {
+        f.inventory = { authority: 'none', devices: [] }; f.manager.refresh();
+      } else if (mode === 'account') {
+        f.inventory = inventory([device()], 'OTHER_ACCOUNT'); f.manager.refresh();
+      }
+      await drain(); await unavailable(on); assert.deepEqual(sink.values(), []);
+      assert.ok(f.logs.every(message => !message.includes('PRIVATE')));
+    });
+  }
+  await t.test('recovery dispatch is reentrant-safe and shutdown during notification stays unavailable', async () => {
+    const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+    f.observation.playback = 'unknown'; await f.refresh();
+    on.on('change', event => {
+      if (event.reason === 'event') {
+        f.manager.refresh(); f.manager.stop();
+      }
+    });
+    f.observation.playback = 'playing'; await f.refresh();
+    assert.deepEqual(sink.values(), [true]); await unavailable(on);
+    await f.refresh(); assert.equal(sink.events.length, 1);
+  });
+  await t.test('revocation during preceding SmartSpeaker notification prevents Switch recovery', async () => {
+    const f = await controls(), sink = notificationSink(f.accessory());
+    f.observation.playback = 'unknown'; await f.refresh();
+    f.current().on('change', () => {
+      f.inventory = { authority: 'none', devices: [] }; f.manager.refresh();
+    });
+    f.observation.playback = 'playing'; await f.refresh();
+    await unavailable(switchOn(f)); assert.deepEqual(sink.values(), []);
+  });
+  await t.test('recovery history is isolated between devices', async () => {
+    const f = await controls(), second = device('SECOND', 'SECOND_MAC');
+    const otherObservation = observation('paused', second);
+    otherObservation.state.topics = { 'online-state': { session: 1, value: { onlineState: 'connected' } } };
+    f.inventory = inventory([device(), second]); f.reader.getDevice = id => id === second.routeId ? otherObservation : f.observation;
+    await f.refresh(); const a = notificationSink(f.accessory()), b = notificationSink(f.accessory(1));
+    f.observation.playback = 'unknown'; await f.refresh();
+    otherObservation.playback = 'empty'; await f.refresh(); assert.deepEqual(b.values(), []);
+    f.observation.playback = 'playing'; await f.refresh(); assert.deepEqual(a.values(), [true]); assert.deepEqual(b.values(), []);
+  });
+  for (const action of ['play', 'pause']) {
+    await t.test('recovery preserves pending ' + action + ', truthful GET and callback-time shared ownership', async () => {
+      const pending = defer(), f = await controls(() => pending.promise), on = switchOn(f);
+      f.observation.playback = action === 'play' ? 'paused' : 'playing'; await f.refresh();
+      const sink = notificationSink(f.accessory()); let settled = false, nested;
+      const write = on.handleSetRequest(action === 'play').then(() => {
+        settled = true;
+      });
+      void write.catch(() => undefined); // Also contain rejection if an earlier assertion aborts the test.
+      assert.equal(await on.handleGetRequest(), action !== 'play'); await f.refresh();
+      assert.deepEqual(sink.values(), []); assert.equal(settled, false);
+      f.observation.playback = 'unknown'; await f.refresh();
+      on.on('change', event => {
+        if (event.reason === 'event' || event.reason === 'write') {
+          nested = rawWrite(f.target(), C.TargetMediaState.PLAY);
+        }
+      });
+      f.observation.playback = action === 'play' ? 'playing' : 'paused'; await f.refresh();
+      assert.equal(await nested, H.RESOURCE_BUSY); assert.equal(settled, false);
+      assert.deepEqual(sink.values(), [action === 'play']);
+      pending.resolve({ ok: true, outcome: 'confirmed' }); await write;
+      assert.equal(await nested, H.RESOURCE_BUSY); assert.equal(on.value, action === 'play');
+      assert.equal(sink.changes.filter(e => e.reason === 'event').length, 1); assert.equal(f.commands.length, 1);
+      await f.refresh(); assert.equal(sink.changes.filter(e => e.reason === 'event').length, 1);
+    });
+  }
+
+  await t.test('refresh reentrancy cannot duplicate recovery, including a GET during notification', async () => {
+    const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+    f.observation.playback = 'unknown'; await f.refresh(); let read;
+    on.on('change', event => {
+      if (event.reason === 'event') {
+        read = on.handleGetRequest(); f.manager.refresh();
+      }
+    });
+    f.observation.playback = 'playing'; await f.refresh();
+    assert.equal(await read, true); assert.deepEqual(sink.values(), [true]);
+    assert.equal(sink.changes.length, 1); assert.equal(on.statusCode, H.SUCCESS);
+  });
+  await t.test('notification failure is contained and does not consume the owed recovery', async () => {
+    const f = await controls(), on = switchOn(f), sink = notificationSink(f.accessory());
+    f.observation.playback = 'unknown'; await f.refresh();
+    const notify = on.sendEventNotification;
+    on.sendEventNotification = () => {
+      throw new Error('PRIVATE');
+    };
+    f.observation.playback = 'playing'; await f.refresh();
+    assert.equal(on.statusCode, H.SERVICE_COMMUNICATION_FAILURE); assert.deepEqual(sink.values(), []);
+    on.sendEventNotification = notify;
+    assert.equal(await on.handleGetRequest(), true); await f.refresh();
+    assert.deepEqual(sink.values(), [true]); assert.deepEqual(f.logs, []);
+    await f.refresh(); assert.equal(sink.events.length, 1);
   });
 
 });
