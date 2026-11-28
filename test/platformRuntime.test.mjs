@@ -438,3 +438,20 @@ test('rapid maintenance notices retain the existing per-message throttle without
   assert.equal(productionLogs(f).filter(([level]) => level === 'info').length, 1);
   assert.equal(f.jobs.size, 0);
 });
+
+for (const enabled of [undefined, false, true, 'true']) {
+  test('trusted playback opt-in reaches both factories: ' + String(enabled), async () => {
+    const seen = [], coordinator = { setCredentials: () => ({ ok: true }), start: () => ({ ok: true }),
+      discover: async () => complete, stop() {} };
+    const f = fixture({ config: { ...credentials, enablePlaybackCommands: true }, dependencies: {
+      enablePlaybackCommands: enabled,
+      coordinatorFactory: (_status, _change, permission) => {
+        seen.push(permission); return coordinator;
+      },
+      presentationFactory: (reader, permission) => {
+        assert.equal(reader, coordinator); seen.push(permission); return { refresh() {}, stop() {} };
+      },
+    } });
+    f.runtime.launch(); await drain(); assert.deepEqual(seen, [enabled === true, enabled === true]);
+  });
+}
